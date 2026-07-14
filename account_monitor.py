@@ -21,6 +21,16 @@ POLL_S = 10
 LIQ_WARN_PCT = 2.0          # warn when price is within 2% of liquidation
 _DEXES = ("", "xyz")        # core book + HIP-3 stocks book
 
+# Shared live-state cache: the single read path for "what's actually open on
+# the exchange right now" — executor/watcher/combiner read this synchronously
+# instead of trusting the journal's write-once-at-open snapshot, which goes
+# stale the moment a position is manually resized/flipped/closed outside the
+# bot. Refreshed every POLL_S by run() below; zero extra network calls added
+# anywhere else in the codebase.
+LIVE: dict[str, "Position"] = {}
+LIVE_ACCOUNT_VALUE = 0.0
+_polled_once = False
+
 
 @dataclass
 class Position:
@@ -37,8 +47,25 @@ class Position:
         return "long" if self.size > 0 else "short"
 
 
-async def _fetch_positions(session: aiohttp.ClientSession, wallet: str) -> dict[str, Position]:
+def get(coin: str) -> Position | None:
+    """The live position on this coin, or None if nothing's open there."""
+    return LIVE.get(coin)
+
+
+def account_value() -> float:
+    """Live exchange equity — for display/monitoring, NOT the sizing ceiling
+    (that's config.TOTAL_BANKROLL, a hardcoded number the user edits directly)."""
+    return LIVE_ACCOUNT_VALUE
+
+
+def has_polled() -> bool:
+    return _polled_once
+
+
+async def _fetch_positions(session: aiohttp.ClientSession, wallet: str,
+                           ) -> tuple[dict[str, Position], float]:
     out: dict[str, Position] = {}
+    account_val = 0.0
     for dex in _DEXES:
         body = {"type": "clearinghouseState", "user": wallet}
         if dex:
@@ -47,6 +74,7 @@ async def _fetch_positions(session: aiohttp.ClientSession, wallet: str) -> dict[
                                 timeout=aiohttp.ClientTimeout(total=15)) as r:
             r.raise_for_status()
             data = await r.json()
+        account_val += float(data.get("marginSummary", {}).get("accountValue", 0) or 0)
         for ap in data.get("assetPositions", []):
             p = ap.get("position") or {}
             szi = float(p.get("szi", 0) or 0)
@@ -62,7 +90,7 @@ async def _fetch_positions(session: aiohttp.ClientSession, wallet: str) -> dict[
                 margin_used=float(p.get("marginUsed", 0) or 0),
                 leverage=int((p.get("leverage") or {}).get("value", 0)),
             )
-    return out
+    return out, account_val
 
 
 def _mark_price(coin: str, stream) -> float:
@@ -78,6 +106,7 @@ def _fmt(x: float) -> str:
 
 
 async def run(wallet: str, stream=None) -> None:
+    global LIVE_ACCOUNT_VALUE, _polled_once
     if not wallet:
         print("[account] no WALLET_ADDRESS; monitor disabled")
         return
@@ -89,11 +118,18 @@ async def run(wallet: str, stream=None) -> None:
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                cur = await _fetch_positions(session, wallet)
+                cur, acct_val = await _fetch_positions(session, wallet)
             except Exception as e:  # noqa: BLE001
                 print(f"[account] poll error: {e!r}")
                 await asyncio.sleep(POLL_S)
                 continue
+
+            # Publish the snapshot atomically (clear+update, not reassign) so a
+            # concurrent reader never sees a half-built dict mid-refresh.
+            LIVE.clear()
+            LIVE.update(cur)
+            LIVE_ACCOUNT_VALUE = acct_val
+            _polled_once = True
 
             if first:
                 first = False
@@ -161,8 +197,9 @@ if __name__ == "__main__":
     async def _smoke() -> None:
         whale = "0x31ca8395cf837de08b24da3f660e77761dfb974b"
         async with aiohttp.ClientSession() as s:
-            pos = await _fetch_positions(s, whale)
-        print(f"fetched {len(pos)} open positions for whale {whale[:10]}…")
+            pos, acct_val = await _fetch_positions(s, whale)
+        print(f"fetched {len(pos)} open positions for whale {whale[:10]}… "
+              f"(accountValue ${acct_val:,.2f})")
         for p in list(pos.values())[:8]:
             print(f"  {p.side:5s} {p.coin:12s} sz={abs(p.size):<12g} entry={_fmt(p.entry):>12s} "
                   f"uPnL={p.upnl:>+12,.2f} liq={_fmt(p.liq)}")

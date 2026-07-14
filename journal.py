@@ -98,15 +98,16 @@ def realized_pnl_usd() -> float:
 
 
 def close_orphans(mids: dict[str, float] | None = None) -> int:
-    """Force-close open rows left over from a previous process (their watcher
-    tasks died with it). With live `mids`, the exit is recorded at the actual
-    current price — reason RESTART, real PnL, counts in stats and bankroll.
-    Without prices (fallback), scratch at entry as ORPHAN (excluded)."""
+    """Force-close open PAPER rows left over from a previous process (dry_run=1
+    only — no real order exists to reattach to, so scratch them). Real live
+    fills (dry_run=0) are NOT touched here: a real order + resting stop/target
+    is sitting on the exchange and must be resumed, not fake-closed — see
+    watcher.resume_live()."""
     mids = mids or {}
     with _conn() as c:
         rows = c.execute(
             "SELECT id, coin FROM signals WHERE (exit_reason IS NULL OR "
-            "exit_reason='') AND horizon != 'runup'").fetchall()
+            "exit_reason='') AND horizon != 'runup' AND dry_run=1").fetchall()
         n = 0
         for sid, coin in rows:
             mid = mids.get(coin, 0.0)
@@ -119,6 +120,36 @@ def close_orphans(mids: dict[str, float] | None = None) -> int:
                           "exit_reason='ORPHAN' WHERE id=?", (time.time(), sid))
             n += 1
         return n
+
+
+def held_position(coin: str) -> tuple[str, str] | None:
+    """(direction, horizon) of the position currently open on this coin, if
+    any — used to catch a contra-signal against something you actually hold."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT direction, horizon FROM signals WHERE executed=1 AND coin=? "
+            "AND (exit_reason IS NULL OR exit_reason='') LIMIT 1", (coin,)).fetchone()
+    return tuple(row) if row else None
+
+
+def all_held_positions() -> list[tuple[str, str, str]]:
+    """(coin, direction, horizon) for every open position — fed to the
+    analyzer as context so it knows what's already held."""
+    with _conn() as c:
+        return c.execute(
+            "SELECT coin, direction, horizon FROM signals WHERE executed=1 "
+            "AND (exit_reason IS NULL OR exit_reason='')").fetchall()
+
+
+def open_live_rows() -> list[tuple]:
+    """Real (dry_run=0), non-runup positions still open in the journal —
+    these have a genuine order + resting stop/target on the exchange and
+    must be resumed with a watcher on restart, never force-closed."""
+    with _conn() as c:
+        return c.execute(
+            "SELECT id, coin, direction, horizon, leverage, entry, ts FROM signals "
+            "WHERE executed=1 AND dry_run=0 AND horizon != 'runup' "
+            "AND (exit_reason IS NULL OR exit_reason='')").fetchall()
 
 
 def record_followup(signal_id: int, column: str, price: float) -> None:

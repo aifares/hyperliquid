@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 
+import account_monitor
 import config
 import journal
 
@@ -107,17 +108,25 @@ def open_executed_positions() -> int:
 
 
 def margin_committed(tier: str | None = None) -> float:
-    """USD margin locked in executed trades that haven't exited yet,
-    optionally for one tier ('scalp' / 'swing' / 'runup')."""
-    q = ("SELECT COALESCE(SUM(margin), 0) FROM signals "
+    """USD margin locked in open trades, optionally for one tier ('scalp' /
+    'swing' / 'runup'). The journal tags which coin belongs to which tier
+    (Hyperliquid has no concept of tiers) — but the $ amount comes from the
+    LIVE position when one exists, since a manual resize makes the journal's
+    stored `margin` stale immediately. Dry-run rows have no real position to
+    check, so they fall back to the journal's own figure."""
+    q = ("SELECT coin, margin, dry_run FROM signals "
          "WHERE executed=1 AND (exit_reason IS NULL OR exit_reason='')")
     args: tuple = ()
     if tier:
         q += " AND horizon = ?"
         args = (tier,)
     with journal._conn() as c:  # noqa: SLF001
-        row = c.execute(q, args).fetchone()
-    return float(row[0])
+        rows = c.execute(q, args).fetchall()
+    total = 0.0
+    for coin, margin, dry in rows:
+        live = None if dry else account_monitor.get(coin)
+        total += live.margin_used if live else margin
+    return total
 
 
 def open_positions(tier: str) -> int:
@@ -129,9 +138,30 @@ def open_positions(tier: str) -> int:
 
 
 def bankroll() -> float:
-    """Working bankroll: starting budget compounded by realized PnL — wins are
-    reinvested into bigger slots, losses shrink them."""
-    return max(0.0, config.TOTAL_BANKROLL + journal.realized_pnl_usd())
+    """Sizing ceiling: a plain hardcoded number the user edits in config.py
+    directly whenever they add/remove funds — no compounding, no dependence
+    on live equity (which now includes manual trades and would otherwise make
+    every tier's budget swing with market noise and trades the bot didn't
+    decide). Live equity is still shown accurately elsewhere (dashboard,
+    account_monitor's own alerts) — just not folded into this ceiling."""
+    return config.TOTAL_BANKROLL
+
+
+def coin_direction_conflict(coin: str, direction: str) -> str | None:
+    """One position per coin, full stop. Hyperliquid NETS every same-coin
+    fill into a single on-chain position regardless of tier, direction, or
+    who opened it (the bot, or a manual trade) — so a second entry doesn't
+    make a second position, it resizes the one that's already there. Checked
+    purely against the LIVE exchange position, not the journal: a manual
+    trade the bot never logged is just as much a conflict as one it opened
+    itself, and a manually-flipped position is caught here too since we're
+    reading its actual current side, not a stale stored direction."""
+    live = account_monitor.get(coin)
+    if live:
+        return (f"🔒 already holding {live.side} {abs(live.size):g} {coin} "
+                f"({live.leverage}x live) — one position per coin (the "
+                f"exchange nets them into one anyway).")
+    return None
 
 
 def guardrail_block(tier: str = "scalp") -> str | None:
@@ -175,6 +205,13 @@ async def _load_sz_decimals() -> None:
                 data = await r.json()
             for a in data.get("universe", []):
                 _sz_decimals[a["name"]] = int(a.get("szDecimals", 2))
+
+
+def round_px(coin: str, px: float) -> float:
+    """Hyperliquid px rules: ≤5 significant figures AND ≤(6 - szDecimals)
+    decimals for perps — violating either silently rejects the order."""
+    dec = max(0, 6 - _sz_decimals.get(coin, 2))
+    return round(float(f"{px:.5g}"), dec)
 
 
 def position_size(coin: str, price: float, leverage: int, margin: float) -> float:
@@ -230,28 +267,47 @@ async def execute(pid: str) -> str:
         return f"❌ Order failed: {e!r}"
 
 
-def _place_bracket_sync(pt: PendingTrade, sz: float, margin: float) -> str:
-    """Blocking SDK calls: market entry + reduce-only stop & target triggers."""
+def _exchange():
+    """Fresh SDK Exchange bound to the agent key, trading on the main account."""
     from eth_account import Account
     from hyperliquid.exchange import Exchange
     from hyperliquid.utils import constants
 
     wallet = Account.from_key(config.HL_AGENT_PRIVATE_KEY)
-    ex = Exchange(wallet, constants.MAINNET_API_URL,
-                  account_address=config.WALLET_ADDRESS or None,
-                  perp_dexs=["xyz"])
+    return Exchange(wallet, constants.MAINNET_API_URL,
+                    account_address=config.WALLET_ADDRESS or None,
+                    perp_dexs=["xyz"])
+
+
+def _place_bracket_sync(pt: PendingTrade, sz: float, margin: float) -> str:
+    """Blocking SDK calls: market entry + reduce-only stop & target triggers.
+    coin_direction_conflict() already blocks entries on a coin that's already
+    held, so update_leverage should normally succeed (nothing open yet) — a
+    failure here means something opened in the race window between that check
+    and this order. watcher's live reconciliation (every ~10s) will correct
+    the stop/target off the position's REAL leverage regardless, so this is
+    just logged for visibility rather than silently swallowed."""
+    ex = _exchange()
     is_buy = pt.direction == "long"
+    try:  # isolated margin caps the worst case at the allotted margin
+        ex.update_leverage(pt.leverage, pt.coin, is_cross=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[executor] update_leverage({pt.leverage}x, {pt.coin}) failed "
+              f"— a position likely opened in the gap since the conflict "
+              f"check; watcher will reconcile the real leverage: {e!r}")
 
     entry = ex.market_open(pt.coin, is_buy, sz)
     if entry.get("status") != "ok":
         raise RuntimeError(f"entry rejected: {entry}")
 
     # Server-side exits (reduce-only triggers), opposite side of the entry.
-    stop_o = ex.order(pt.coin, not is_buy, sz, pt.stop,
-                      {"trigger": {"triggerPx": pt.stop, "isMarket": True, "tpsl": "sl"}},
+    stop_px = round_px(pt.coin, pt.stop)
+    tgt_px = round_px(pt.coin, pt.target)
+    stop_o = ex.order(pt.coin, not is_buy, sz, stop_px,
+                      {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}},
                       reduce_only=True)
-    tp_o = ex.order(pt.coin, not is_buy, sz, pt.target,
-                    {"trigger": {"triggerPx": pt.target, "isMarket": True, "tpsl": "tp"}},
+    tp_o = ex.order(pt.coin, not is_buy, sz, tgt_px,
+                    {"trigger": {"triggerPx": tgt_px, "isMarket": True, "tpsl": "tp"}},
                     reduce_only=True)
     notes = []
     if stop_o.get("status") != "ok":
@@ -261,6 +317,51 @@ def _place_bracket_sync(pt: PendingTrade, sz: float, margin: float) -> str:
     tail = ("\n" + "\n".join(notes)) if notes else "\n✅ stop + target resting on exchange."
     return (f"✅ FILLED: {pt.direction.upper()} {sz} {pt.coin} "
             f"(${margin:.2f} margin @ {pt.leverage}x){tail}")
+
+
+def place_runup_entry_sync(coin: str, sz: float, leverage: int, stop: float) -> str:
+    """Live run-up entry: isolated-margin market long + a server-side reduce-only
+    stop, so the -3% backstop holds even if this process dies mid-hold."""
+    ex = _exchange()
+    try:
+        ex.update_leverage(leverage, coin, is_cross=False)
+    except Exception:  # noqa: BLE001
+        pass
+    entry = ex.market_open(coin, True, sz)
+    if entry.get("status") != "ok":
+        raise RuntimeError(f"entry rejected: {entry}")
+    stop_px = round_px(coin, stop)
+    stop_o = ex.order(coin, False, sz, stop_px,
+                      {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}},
+                      reduce_only=True)
+    if stop_o.get("status") != "ok":
+        return f"filled, but ⚠️ stop order rejected: {stop_o}"
+    return "filled ✅ server-side stop resting."
+
+
+def close_position_sync(coin: str) -> str:
+    """Live close: market-close the whole position and cancel resting orders
+    (the run-up's server-side stop). Safe if the stop already fired."""
+    ex = _exchange()
+    notes = []
+    try:
+        res = ex.market_close(coin)
+        if res is None:
+            notes.append("no position on exchange (stop already filled?)")
+        elif res.get("status") != "ok":
+            notes.append(f"close rejected: {res}")
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"close failed: {e!r}")
+    try:
+        from hyperliquid.info import Info
+        from hyperliquid.utils import constants
+        info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["xyz"])
+        for o in info.open_orders(config.WALLET_ADDRESS):
+            if o.get("coin") == coin:
+                ex.cancel(coin, o["oid"])
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"stop-cancel failed: {e!r}")
+    return "; ".join(notes) if notes else "closed ✅ resting stop cancelled."
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ import time
 from datetime import date, datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
+import account_monitor
 import config
 import earnings
 import executor
@@ -33,6 +34,32 @@ from hl_stream import HLStream
 NY = ZoneInfo("America/New_York")
 POLL_S = 60
 _active: set[str] = set()        # "coin:report_date" currently held or done
+_veto: dict[str, dict] = {}      # coin -> pending bearish-news early-exit flag
+
+
+def _open_runup_coins() -> set[str]:
+    with journal._conn() as c:  # noqa: SLF001
+        return {r[0] for r in c.execute(
+            "SELECT coin FROM signals WHERE horizon='runup' AND executed=1 "
+            "AND (exit_reason IS NULL OR exit_reason='')").fetchall()}
+
+
+def flag_bearish(coin: str, direction: str, confidence: float,
+                 magnitude: float, headline: str) -> None:
+    """Called from the news path for every actionable signal. Arms an early
+    exit on a HELD run-up only when a bearish read clears both conviction bars
+    — routine chop must not knock us out of a run-up that's meant to ride
+    through pre-earnings dips."""
+    if not config.RUNUP_NEWS_EXIT or direction != "short":
+        return
+    if confidence < config.RUNUP_NEWS_MIN_CONF or magnitude < config.RUNUP_NEWS_MIN_MAG:
+        return
+    if coin not in _open_runup_coins():
+        return
+    _veto[coin] = {"conf": confidence, "mag": magnitude,
+                   "headline": headline, "ts": time.time()}
+    print(f"[runup] 📰 NEWS-VETO armed for {coin} "
+          f"(conf {confidence:.2f}, mag {magnitude:.2f}) — {headline[:80]!r}")
 
 
 def _prev_trading_day(d: date) -> date:
@@ -97,6 +124,25 @@ async def _enter(coin: str, p: dict, stream: HLStream) -> None:
     stop = entry * (1 - config.RUNUP_STOP_RAW)
     label = config.MARKET_BY_COIN[coin].label
     late = date.today() > p["entry_day"]
+
+    live_note = ""
+    if not executor.DRY_RUN:
+        await executor._load_sz_decimals()  # noqa: SLF001
+        sz = executor.position_size(coin, entry, config.RUNUP_LEVERAGE, slot)
+        if sz <= 0:
+            print(f"[runup] {coin}: size 0 for ${slot:.2f} margin — skipping")
+            _active.add(f"{coin}:{p['report']}")
+            return
+        try:
+            live_note = "\n" + await asyncio.to_thread(
+                executor.place_runup_entry_sync, coin, sz,
+                config.RUNUP_LEVERAGE, stop)
+        except Exception as e:  # noqa: BLE001 — no order, no journal entry
+            await notifier.send(f"❌ RUN-UP order failed for {label}: {e!r}")
+            print(f"[runup] {coin}: live entry FAILED: {e!r}")
+            _active.add(f"{coin}:{p['report']}")   # don't hammer a broken order
+            return
+
     sid = journal.log_signal(
         coin=coin, direction="long", confidence=0.7, magnitude=0.5,
         leverage=config.RUNUP_LEVERAGE, entry=entry,
@@ -117,7 +163,7 @@ async def _enter(coin: str, p: dict, stream: HLStream) -> None:
         f"-{config.RUNUP_STOP_RAW*config.RUNUP_LEVERAGE*100:.0f}% margin)\n"
         f"<b>Exit:</b> before the {p['report']} print (~{days_left}d)\n"
         f"<i>Announcement-premium tier — backtested, "
-        f"{'DRY RUN' if executor.DRY_RUN else 'LIVE'}.</i>")
+        f"{'DRY RUN' if executor.DRY_RUN else 'LIVE'}.</i>{live_note}")
     print(f"[runup] ENTER long {coin} @ {entry:g} (${slot:.2f} @ "
           f"{config.RUNUP_LEVERAGE}x, exit {p['report']})")
     asyncio.create_task(_watch(sid, coin, label, entry, stop, p["exit_ts"], stream))
@@ -126,26 +172,62 @@ async def _enter(coin: str, p: dict, stream: HLStream) -> None:
 async def _watch(sid: int, coin: str, label: str, entry: float, stop: float,
                  exit_ts: float, stream: HLStream) -> None:
     lev = config.RUNUP_LEVERAGE
+    is_live = not executor.DRY_RUN
     while True:
         await asyncio.sleep(30)
         st = stream.state.get(coin)
-        if st is None or st.mid <= 0:
-            continue
-        mid = st.mid
-        if mid <= stop:
-            reason, emoji, note = "STOP", "🛑", "Run-up stop hit — thesis pauses, exit."
-        elif time.time() >= exit_ts:
-            reason, emoji, note = "PRINT", "📅", (
-                "Exiting before the earnings print — the run-up premium is "
-                "collected; holding through the print is a coin flip we don't take.")
-        else:
-            continue
+        mid = st.mid if st and st.mid > 0 else 0.0
+        reason = emoji = note = None
+
+        # Reconcile against the REAL position — a manual close/flip/resize on
+        # a run-up coin would otherwise be invisible for the whole 10-day hold.
+        if is_live and account_monitor.has_polled():
+            live_pos = account_monitor.get(coin)
+            if live_pos is None:
+                reason, emoji, note = "EXTERNAL", "🔚", (
+                    "Position no longer exists on the exchange (closed "
+                    "manually, the stop fired, or liquidation) — stopping "
+                    "the watch, nothing left here to manage.")
+                mid = mid or entry
+            elif live_pos.side != "long":  # run-up only ever goes long
+                reason, emoji, note = "EXTERNAL_FLIP", "🔀", (
+                    f"Position was flipped to {live_pos.side} outside the bot "
+                    f"— the run-up thesis no longer applies. Stopping the "
+                    f"watch rather than adopting the new side.")
+                mid = live_pos.entry or mid or entry
+            elif live_pos.entry > 0 and abs(live_pos.entry - entry) > 1e-9:
+                print(f"[runup] {coin} resized live: entry {entry:g}->"
+                      f"{live_pos.entry:g} — recomputing stop off the real entry")
+                entry = live_pos.entry
+                stop = entry * (1 - config.RUNUP_STOP_RAW)
+
+        if reason is None:
+            if mid <= 0:
+                continue
+            if mid <= stop:
+                reason, emoji, note = "STOP", "🛑", "Run-up stop hit — thesis pauses, exit."
+            elif time.time() >= exit_ts:
+                reason, emoji, note = "PRINT", "📅", (
+                    "Exiting before the earnings print — the run-up premium is "
+                    "collected; holding through the print is a coin flip we don't take.")
+            elif config.RUNUP_NEWS_EXIT and coin in _veto:
+                v = _veto.pop(coin)
+                reason, emoji, note = "NEWS", "📰", (
+                    f"Bearish catalyst (conf {v['conf']:.2f}, mag {v['mag']:.2f}) — "
+                    f"exiting the run-up early rather than waiting for the -3% stop: "
+                    f"{v['headline'][:120]}")
+            else:
+                continue
+        if is_live and reason not in ("EXTERNAL", "EXTERNAL_FLIP"):
+            status = await asyncio.to_thread(executor.close_position_sync, coin)
+            print(f"[runup] live close {coin}: {status}")
         pnl_pct = (mid - entry) / entry * 100
         await notifier.send(notifier.build_exit_alert(
             label=label, coin=coin, direction="long", entry=entry, exit_px=mid,
             pnl_pct=pnl_pct, reason=reason, emoji=emoji, note=note,
             horizon="runup", leverage=lev))
         journal.record_exit(sid, exit_px=mid, reason=reason)
+        _veto.pop(coin, None)   # position gone; drop any stale veto flag
         print(f"[runup] EXIT {reason} {coin} @ {mid:g} ({pnl_pct:+.2f}% raw)")
         return
 
@@ -161,6 +243,9 @@ def _resume(stream: HLStream) -> int:
         report = headline.split()[-2] if "print" in headline else None
         p = plan(coin)
         exit_ts = p["exit_ts"] if p else time.time() + 86400
+        live_pos = account_monitor.get(coin) if account_monitor.has_polled() else None
+        if live_pos and live_pos.entry > 0:
+            entry = live_pos.entry
         stop = entry * (1 - config.RUNUP_STOP_RAW)
         label = config.MARKET_BY_COIN[coin].label if coin in config.MARKET_BY_COIN else coin
         _active.add(f"{coin}:{report or (p and p['report'])}")

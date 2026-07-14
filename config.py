@@ -33,13 +33,16 @@ WALLET_ADDRESS = _opt("WALLET_ADDRESS")
 HL_AGENT_PRIVATE_KEY = _opt("HL_AGENT_PRIVATE_KEY")
 
 # --- Execution guardrails (semi-auto mode) -----------------------------------
-TOTAL_BANKROLL = 100.0          # USD total margin budget across ALL open trades
-MIN_MARGIN_PER_TRADE = 5.0      # below this leftover, skip rather than dust in
+TOTAL_BANKROLL = 17.5           # USD total margin budget across ALL open trades
+                                # (live 2026-07-14: $17.71 deposited, small buffer)
+MIN_MARGIN_PER_TRADE = 2.0      # below this leftover, skip rather than dust in
+                                # ($2 @ 5x = $10 notional, the exchange minimum)
 MAX_CONCURRENT_POSITIONS = 3    # bot won't open a 4th
 DAILY_LOSS_LIMIT = 3            # stopped-out executed trades/day -> halt
 PENDING_TRADE_TTL_S = 900       # Execute button expires after 15 min
-AUTO_EXECUTE_DRY_RUN = True     # dry-run trades itself (tests sizing/budget);
-                                # live mode ALWAYS waits for the Execute button
+AUTO_EXECUTE_DRY_RUN = True     # dry-run trades itself (tests sizing/budget)
+AUTO_EXECUTE_LIVE = True        # live trades itself too — fully automated per
+                                # user (2026-07-14); flip False for button-confirm
 
 TELEGRAM_CHANNELS = [
     c.strip().lstrip("@")
@@ -104,8 +107,26 @@ RUNUP_ENABLED = _opt("RUNUP_ENABLED", "0") == "1"
 RUNUP_LEVERAGE = 5
 RUNUP_ENTRY_TDAYS = 10          # trading days before the print to enter
 RUNUP_STOP_RAW = 0.03           # -3% raw = -15% on margin hard stop
-RUNUP_MAX_CONCURRENT = 4        # own cap (earnings cluster in season)
+RUNUP_MAX_CONCURRENT = 2        # own cap (was 4; shrunk for the $17.5 bankroll)
 RUNUP_EXCLUDE = {"xyz:TSLA"}    # negative run-up expectancy in backtest
+
+# News-veto exit: bail a held run-up EARLY if a genuinely bad, high-conviction
+# catalyst lands on that exact ticker — before the -3% price stop would trip.
+# UNVALIDATED tweak to a validated strategy (the +1.59%/event edge was pure
+# calendar mechanics; 54% of WINNING run-ups dip -2.5% first, so the bar is set
+# high to avoid whipsawing out of normal noise). Toggle via RUNUP_NEWS_EXIT.
+RUNUP_NEWS_EXIT = _opt("RUNUP_NEWS_EXIT", "0") == "1"
+RUNUP_NEWS_MIN_CONF = 0.80      # analyzer confidence floor for a veto
+RUNUP_NEWS_MIN_MAG = 0.60       # analyzer magnitude floor (size of the move)
+
+# Same news-veto exit, generalized to scalp/swing: a held position with no
+# tape-driven exit for LOSING trades (FADE only protects winners; STOP is a
+# big price move away) otherwise has nothing but the clock to save it from a
+# thesis that's gone bad. Same conservative bars as the run-up veto — this is
+# still an early-exit override, not a new trading signal, so it stays strict.
+NEWS_EXIT_SCALP_SWING = _opt("NEWS_EXIT_SCALP_SWING", "0") == "1"
+NEWS_EXIT_MIN_CONF = 0.80
+NEWS_EXIT_MIN_MAG = 0.60
 
 # --- Data-driven bankroll allocation (across ALL methods) ----------------------
 # Weighted by evidence (backtests/RESULTS.md):
@@ -118,7 +139,9 @@ RUNUP_EXCLUDE = {"xyz:TSLA"}    # negative run-up expectancy in backtest
 # Shares recompute off the LIVE bankroll, so tiers that win grow their own
 # budgets and tiers that lose shrink — allocation self-adjusts with results.
 TIER_BUDGET_FRAC = {"runup": 0.50, "swing": 0.30, "scalp": 0.20}
-TIER_MAX_CONCURRENT = {"runup": 4, "swing": 2, "scalp": 2}
+# one slot per news tier at the $17.5 live bankroll — a $2.60 half-slot would
+# sit under the exchange's $10 minimum notional at 5x
+TIER_MAX_CONCURRENT = {"runup": 2, "swing": 1, "scalp": 1}
 # per-name backtested mean net return per run-up event (% notional, 10y)
 RUNUP_EDGE = {
     "xyz:AMD": 2.72, "xyz:MU": 2.54, "xyz:NVDA": 2.34, "xyz:GOOGL": 2.02,
@@ -144,3 +167,11 @@ BOOK_IMBALANCE_THRESHOLD = 0.65 # fraction of top-of-book depth on one side
 ALERT_COOLDOWN_SECONDS = 1800   # min gap between alerts for same coin+direction
 ALERT_BURST_MAX = 3             # max full alerts per burst window (all markets) —
 ALERT_BURST_WINDOW_S = 600      # one macro headline shouldn't fan out to 7 alerts
+
+# --- Reversal guard (per-coin signal ledger) ----------------------------------
+# A same-coin direction FLIP within this window, against a recently confident
+# read, needs extra conviction to fire — one headline shouldn't reverse a
+# thesis that was just confirmed; that takes accumulating contradiction.
+NEWS_REVERSAL_WINDOW_S = 7200        # 2h: how long a prior read still "counts"
+NEWS_REVERSAL_PRIOR_MIN_CONF = 0.6   # the prior read must have been reasonably sure
+NEWS_REVERSAL_MIN_CONF = 0.75        # the flipping signal must clear this bar

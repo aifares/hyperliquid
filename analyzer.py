@@ -8,14 +8,29 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 
+import anthropic
 from anthropic import AsyncAnthropic
 
 import config
+import journal
 from events import NewsEvent
 
 MODEL = "claude-haiku-4-5-20251001"   # fast/cheap triage tier
+
+# Errors that will NEVER succeed on retry (bad key, no credits, malformed
+# request) — hammering these 3x per headline is pure waste, and doing it on
+# every subsequent headline too is worse. One permanent error trips a circuit
+# breaker: skip the API entirely for a cooldown, back off further if it's
+# still broken next time, reset once a call actually succeeds.
+_PERMANENT_ERRORS = (anthropic.BadRequestError, anthropic.AuthenticationError,
+                     anthropic.PermissionDeniedError, anthropic.NotFoundError)
+_PAUSE_INITIAL_S = 60.0
+_PAUSE_MAX_S = 1800.0
+_paused_until = 0.0
+_pause_s = _PAUSE_INITIAL_S
 
 _MARKET_LIST = "\n".join(
     f"- {m.coin}: {m.label} (max {m.max_leverage}x)" for m in config.MARKETS
@@ -37,7 +52,11 @@ _SYSTEM = (
     "(breaking macro, geopolitical shocks, surprise announcements); 'swing' for "
     "slower theses that play out over days (guidance changes, analyst cycles, "
     "product launches, regulatory processes).\n"
-    "- Be conservative: when unsure, use direction 'none'."
+    "- Be conservative: when unsure, use direction 'none'.\n\n"
+    "You will also be told which positions are currently held. This is "
+    "context only, not a bias: give your honest, independent read of the "
+    "news regardless of what's held. If the news genuinely contradicts a "
+    "held position, say so plainly in the rationale — don't soften it."
 )
 
 # Tool schema forces well-formed structured output.
@@ -86,12 +105,29 @@ class NewsSignal:
         return self.confidence >= 0.5 and self.magnitude >= 0.3
 
 
+def _positions_context() -> str:
+    held = journal.all_held_positions()
+    if not held:
+        return "Positions currently held: none."
+    lines = "\n".join(f"- {coin} {d.upper()} ({hz})" for coin, d, hz in held)
+    return f"Positions currently held:\n{lines}"
+
+
 class Analyzer:
     def __init__(self) -> None:
         self.client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
     async def analyze(self, ev: NewsEvent) -> NewsSignal:
+        global _paused_until, _pause_s
         out: dict = {}
+
+        if time.time() < _paused_until:
+            return _none_signal(ev)  # circuit open — don't spend a call to learn this again
+
+        user_content = (
+            f"{_positions_context()}\n\n"
+            f"News item from {ev.source}:\n\n{ev.text}"
+        )
         # A dropped headline is a lost signal — retry through short network blips.
         for attempt in (1, 2, 3):
             try:
@@ -101,11 +137,18 @@ class Analyzer:
                     system=_SYSTEM,
                     tools=[_TOOL],
                     tool_choice={"type": "tool", "name": "emit_signal"},
-                    messages=[{"role": "user",
-                               "content": f"News item from {ev.source}:\n\n{ev.text}"}],
+                    messages=[{"role": "user", "content": user_content}],
                 )
                 out = _extract_tool_input(resp)
+                _pause_s = _PAUSE_INITIAL_S  # a real success resets the backoff
                 break
+            except _PERMANENT_ERRORS as e:
+                _paused_until = time.time() + _pause_s
+                print(f"[analyzer] PERMANENT error, pausing analyzer for "
+                      f"{_pause_s:.0f}s (no point retrying this or the next "
+                      f"few headlines): {e!r}")
+                _pause_s = min(_pause_s * 2, _PAUSE_MAX_S)
+                break  # this exact call won't succeed on retry either
             except Exception as e:  # noqa: BLE001
                 print(f"[analyzer] error (attempt {attempt}/3): {e!r}")
                 if attempt < 3:
@@ -130,6 +173,11 @@ def _extract_tool_input(resp) -> dict:
         if getattr(block, "type", None) == "tool_use":
             return block.input
     return {}
+
+
+def _none_signal(ev: NewsEvent) -> NewsSignal:
+    return NewsSignal(event=ev, coin="NONE", direction="none",
+                      magnitude=0.0, confidence=0.0, rationale="analyzer paused")
 
 
 # --- offline test (no API): validate schema/dataclass wiring -----------------

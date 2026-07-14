@@ -23,6 +23,7 @@ import earnings_runup
 import news
 import tg_buttons
 import tg_reader
+import watcher
 from analyzer import Analyzer
 from combiner import handle_signal
 from events import NewsEvent
@@ -76,6 +77,11 @@ async def main() -> None:
     queue: asyncio.Queue[NewsEvent] = asyncio.Queue()
     coins = [m.coin for m in config.MARKETS]
     stream = HLStream(coins)
+
+    resumed_live = watcher.resume_live(stream)
+    if resumed_live:
+        print(f"[watcher] resumed {resumed_live} real position(s) from a "
+              f"previous run (order + stop/target already on the exchange)")
 
     tasks = [
         asyncio.create_task(stream.run(), name="hl"),
