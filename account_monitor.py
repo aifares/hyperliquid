@@ -29,6 +29,7 @@ _DEXES = ("", "xyz")        # core book + HIP-3 stocks book
 # anywhere else in the codebase.
 LIVE: dict[str, "Position"] = {}
 LIVE_ACCOUNT_VALUE = 0.0
+SPOT_AVAILABLE = 0.0
 _polled_once = False
 
 
@@ -62,6 +63,15 @@ def has_polled() -> bool:
     return _polled_once
 
 
+def spot_available() -> float:
+    """Real, uncommitted USDC free to back a NEW position — from the spot
+    balance's own maintenance-adjusted figure (matches the app's "Available
+    Balance" exactly), NOT the xyz dex's clearinghouse `withdrawable`, which
+    reads as $0 the moment funds are parked in any open position there even
+    though the account overall still has free capital sitting in spot."""
+    return SPOT_AVAILABLE
+
+
 async def _fetch_positions(session: aiohttp.ClientSession, wallet: str,
                            ) -> tuple[dict[str, Position], float]:
     out: dict[str, Position] = {}
@@ -93,6 +103,18 @@ async def _fetch_positions(session: aiohttp.ClientSession, wallet: str,
     return out, account_val
 
 
+async def _fetch_spot_available(session: aiohttp.ClientSession, wallet: str) -> float:
+    body = {"type": "spotClearinghouseState", "user": wallet}
+    async with session.post(config.HL_INFO_URL, json=body,
+                            timeout=aiohttp.ClientTimeout(total=15)) as r:
+        r.raise_for_status()
+        data = await r.json()
+    for token_id, avail in data.get("tokenToAvailableAfterMaintenance", []):
+        if token_id == 0:   # USDC is always token 0
+            return float(avail)
+    return 0.0
+
+
 def _mark_price(coin: str, stream) -> float:
     if stream is not None:
         st = stream.state.get(coin)
@@ -106,7 +128,7 @@ def _fmt(x: float) -> str:
 
 
 async def run(wallet: str, stream=None) -> None:
-    global LIVE_ACCOUNT_VALUE, _polled_once
+    global LIVE_ACCOUNT_VALUE, SPOT_AVAILABLE, _polled_once
     if not wallet:
         print("[account] no WALLET_ADDRESS; monitor disabled")
         return
@@ -119,6 +141,7 @@ async def run(wallet: str, stream=None) -> None:
         while True:
             try:
                 cur, acct_val = await _fetch_positions(session, wallet)
+                spot_avail = await _fetch_spot_available(session, wallet)
             except Exception as e:  # noqa: BLE001
                 print(f"[account] poll error: {e!r}")
                 await asyncio.sleep(POLL_S)
@@ -129,6 +152,7 @@ async def run(wallet: str, stream=None) -> None:
             LIVE.clear()
             LIVE.update(cur)
             LIVE_ACCOUNT_VALUE = acct_val
+            SPOT_AVAILABLE = spot_avail
             _polled_once = True
 
             if first:

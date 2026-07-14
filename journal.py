@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS signals (
     exit_reason TEXT,
     executed INTEGER DEFAULT 0,
     dry_run INTEGER DEFAULT 0,
-    margin REAL DEFAULT 0
+    margin REAL DEFAULT 0,
+    stop REAL DEFAULT NULL
 );
 """
 
@@ -55,17 +56,20 @@ def _migrate(c: sqlite3.Connection) -> None:
         c.execute("ALTER TABLE signals ADD COLUMN dry_run INTEGER DEFAULT 0")
     if "margin" not in cols:
         c.execute("ALTER TABLE signals ADD COLUMN margin REAL DEFAULT 0")
+    if "stop" not in cols:
+        c.execute("ALTER TABLE signals ADD COLUMN stop REAL DEFAULT NULL")
 
 
 def log_signal(*, coin: str, direction: str, confidence: float, magnitude: float,
                leverage: int, entry: float, headline: str, rationale: str,
-               tape_note: str, horizon: str = "scalp") -> int:
+               tape_note: str, horizon: str = "scalp",
+               stop: float | None = None) -> int:
     with _conn() as c:
         cur = c.execute(
             "INSERT INTO signals (ts,coin,direction,confidence,magnitude,leverage,"
-            "horizon,entry,headline,rationale,tape_note) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "horizon,entry,headline,rationale,tape_note,stop) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), coin, direction, confidence, magnitude, leverage,
-             horizon, entry, headline, rationale, tape_note),
+             horizon, entry, headline, rationale, tape_note, stop),
         )
         return cur.lastrowid
 
@@ -144,10 +148,12 @@ def all_held_positions() -> list[tuple[str, str, str]]:
 def open_live_rows() -> list[tuple]:
     """Real (dry_run=0), non-runup positions still open in the journal —
     these have a genuine order + resting stop/target on the exchange and
-    must be resumed with a watcher on restart, never force-closed."""
+    must be resumed with a watcher on restart, never force-closed. Includes
+    the stop FROZEN at entry time (NULL for legacy rows opened before that
+    column existed) so a restart can't silently apply a newer geometry."""
     with _conn() as c:
         return c.execute(
-            "SELECT id, coin, direction, horizon, leverage, entry, ts FROM signals "
+            "SELECT id, coin, direction, horizon, leverage, entry, ts, stop FROM signals "
             "WHERE executed=1 AND dry_run=0 AND horizon != 'runup' "
             "AND (exit_reason IS NULL OR exit_reason='')").fetchall()
 

@@ -23,12 +23,37 @@ def liquidation_price(entry: float, direction: str, leverage: int) -> float:
     return entry * (1 + frac)
 
 
-def stop_price(entry: float, direction: str, leverage: int) -> float:
-    """Suggested stop: half the distance to liquidation (keeps you alive)."""
+def stop_price(entry: float, direction: str, horizon: str = "scalp") -> float:
+    """Fixed-% stop by tier (config.SCALP_STOP_RAW / SWING_STOP_RAW) — for a
+    BRAND NEW entry only. An already-open trade's own stop is frozen in
+    journal.signals.stop at entry time; use resolve_stop() to read it back
+    rather than recomputing here, or a later config edit would silently
+    retighten/loosen a position that's already live."""
+    frac = config.SWING_STOP_RAW if horizon == "swing" else config.SCALP_STOP_RAW
+    if direction == "long":
+        return entry * (1 - frac)
+    return entry * (1 + frac)
+
+
+def legacy_stop_price(entry: float, direction: str, leverage: int) -> float:
+    """The pre-fix formula (half the distance to liquidation) — ONLY for
+    reconstructing the stop of a trade opened before the geometry fix, whose
+    journal row has no stored `stop` (NULL = legacy)."""
     frac = 0.5 / leverage
     if direction == "long":
         return entry * (1 - frac)
     return entry * (1 + frac)
+
+
+def resolve_stop(entry: float, direction: str, leverage: int, horizon: str,
+                 stored_stop: float | None) -> float:
+    """The stop to use for an ALREADY-OPEN trade: its own frozen value if one
+    was stored at entry, else the legacy formula (rows opened before the
+    stop column existed). Never recomputes from today's config — that would
+    let a later geometry change silently move a live position's real risk."""
+    if stored_stop:
+        return stored_stop
+    return legacy_stop_price(entry, direction, leverage)
 
 
 def build_alert(*, label: str, coin: str, direction: str, entry: float,
@@ -40,7 +65,7 @@ def build_alert(*, label: str, coin: str, direction: str, entry: float,
     tier = "⚡ SCALP (minutes–hours, exit same session)" if horizon == "scalp" \
         else "🌊 SWING (multi-day hold — sized at low leverage)"
     liq = liquidation_price(entry, direction, leverage)
-    stop = stop_price(entry, direction, leverage)
+    stop = stop_price(entry, direction, horizon)
     conv = int(round(confidence * magnitude * 100))
 
     def fmt(x: float) -> str:

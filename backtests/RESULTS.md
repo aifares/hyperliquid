@@ -62,3 +62,25 @@ Direction-agnostic first-touch sim (measures reachability, not edge):
   funding spikes around crowded events could be worse.
 - 1m scalp geometry sample is only ~3.5 days (API depth limit) — regime-specific.
 - Earnings n≈38-40/name: solid for direction, not for fine parameter tuning.
+
+## Crypto sweep (2026-07-14) — BTC, SOL, XRP, HYPE · 208 days of 1h/15m + full funding history
+
+Five a-priori strategies (no grid search), net of 0.11% friction + actual hourly
+funding, split-half consistency required. 21 combos tested, **1 pass**:
+
+| Strategy | Result |
+|---|---|
+| momo24 (24h momentum) | dead everywhere (26–29% win; chop eats trends) |
+| fundfade (funding-extreme fade) | dead everywhere (extremes persist, don't revert) |
+| btclead (BTC 1h lead-lag into alts) | decisively dead (−21% to −66%); priced in within the hour |
+| breakout (24h Donchian) | +BTC h1 only — UNSTABLE; negative elsewhere |
+| **wickfade (capitulation-wick fade, BTC only)** | **PASS: +0.096%/trade, n=62, 55% win, both halves positive — but h2 only +0.2%, edge ≈ 1 friction unit. TOO THIN to fund at current size.** |
+
+Context: buy&hold over the window: BTC −26%, SOL −37%, XRP −41%, HYPE +168%.
+Nothing tested beat simply holding HYPE — and none of these coins' strategies
+came close to the earnings run-up (+1.59%/event, n=389). SOL/XRP/HYPE produced
+NO deployable signal at all.
+
+**Verdict: no crypto tier. BTC stays news-gated optionality. wickfade goes on
+the shadow-watch list — worth re-testing with more history or live liquidation
+prints as the trigger instead of the candle proxy, not worth real margin yet.**

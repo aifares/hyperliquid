@@ -166,10 +166,24 @@ def coin_direction_conflict(coin: str, direction: str) -> str | None:
 
 def guardrail_block(tier: str = "scalp") -> str | None:
     """Return a human reason if trading is currently blocked, else None.
-    Kill switch is global; concurrency and budget are per tier."""
+    Kill switch and real-margin check are global; concurrency and budget are
+    per tier."""
     if losses_today() >= config.DAILY_LOSS_LIMIT:
         return (f"🛑 KILL SWITCH: {config.DAILY_LOSS_LIMIT} stopped-out trades "
                 f"today. Halted until midnight ET.")
+    # The bot's own tier-budget math can say "plenty of room" while the real
+    # exchange account has nothing free (e.g. a manual trade parked margin
+    # the bot's own tracking never sees) — check REAL spot balance before
+    # even considering tier budget, so it refuses cleanly instead of
+    # attempting an order that the exchange would just reject anyway. Only
+    # meaningful for real orders — a paper (DRY_RUN) fill never touches the
+    # actual account, so this doesn't apply there.
+    if not DRY_RUN and account_monitor.has_polled():
+        free = account_monitor.spot_available()
+        if free < config.MIN_MARGIN_PER_TRADE:
+            return (f"💸 Only ${free:.2f} actually free on the exchange "
+                    f"(below the ${config.MIN_MARGIN_PER_TRADE:.0f} minimum) — "
+                    f"account fully deployed, not attempting a trade.")
     cap = config.TIER_MAX_CONCURRENT.get(tier, 2)
     if open_positions(tier) >= cap:
         return (f"⛔ {cap} {tier} positions already open — "

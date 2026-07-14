@@ -20,6 +20,7 @@ import market_hours
 import notifier
 import tape
 import tg_buttons
+import trend
 import watcher
 from analyzer import NewsSignal
 from hl_stream import HLStream
@@ -27,6 +28,7 @@ from hl_stream import HLStream
 _last_alert: dict[str, float] = {}   # "coin:direction" -> ts of last full alert
 _recent_alerts: list[float] = []     # ts of every full alert, any market
 _last_contra: dict[str, float] = {}  # "coin" -> ts of last contra-signal warning
+_last_trend_note: dict[str, float] = {}  # "coin:direction" -> ts of last trend-block note
 _signal_ledger: dict[str, dict] = {} # coin -> {"direction","confidence","ts"} of
                                       # the last actionable read, any tier/outcome —
                                       # powers the reversal guard below
@@ -102,6 +104,33 @@ async def handle_signal(sig: NewsSignal, stream: HLStream) -> None:
                     f"Watching, not acting.</i>")
         print(f"[combiner] contra-signal {sig.direction} {sig.coin} "
               f"(holding {live_pos.side}, {tier}) armed={armed}")
+        return
+
+    # --- entry-quality gates (2026-07-14, from live-trade review) -------------
+    # These stop NEW entries only; the run-up veto and contra-signal handling
+    # above already ran, so held positions stay fully protected regardless.
+    if sig.horizon == "scalp" and sig.coin in config.SCALP_EXCLUDE:
+        print(f"[combiner] no index scalps: {sig.direction} {sig.coin} skipped "
+              f"(recap headlines aren't catalysts; swing on indexes still allowed)")
+        return
+    if (config.SCALP_RTH_ONLY and sig.horizon == "scalp"
+            and sig.coin.startswith("xyz:") and not market_hours.is_rth()):
+        print(f"[combiner] off-hours: scalp {sig.direction} {sig.coin} skipped "
+              f"(thin book outside NYSE RTH; the losing 05:20 MU short is why)")
+        return
+    # Never fade a strong same-day move — the 30s tape window can't see daily
+    # trend, so this is checked against actual 24h price change. to_thread:
+    # the lookup may do one cached network refresh and must not block the loop.
+    fade = await asyncio.to_thread(trend.fade_block, sig.coin, sig.direction)
+    if fade:
+        key = f"{sig.coin}:{sig.direction}"
+        if time.time() - _last_trend_note.get(key, 0.0) >= config.ALERT_COOLDOWN_SECONDS:
+            _last_trend_note[key] = time.time()
+            await notifier.send(
+                f"🚫 <b>Trend filter ({market.label})</b>\n{fade}\n"
+                f"<b>Headline:</b> {sig.event.text}\n"
+                f"<i>Not fighting the day's move — watching, not acting.</i>")
+        print(f"[combiner] trend filter: {sig.direction} {sig.coin} blocked — {fade}")
         return
 
     st = stream.state.get(sig.coin)
@@ -190,13 +219,17 @@ async def handle_signal(sig: NewsSignal, stream: HLStream) -> None:
             gap_warn = earnings.swing_gap_warning(sig.coin)
             if gap_warn:
                 text = f"{gap_warn}\n\n{text}"
+        # Computed BEFORE log_signal and frozen into the row (journal.stop):
+        # this exact value is what the trade keeps for its entire life, even
+        # if SCALP_STOP_RAW/SWING_STOP_RAW change later — see
+        # notifier.resolve_stop() and the "new trades only" scoping.
+        stop = notifier.stop_price(entry, sig.direction, sig.horizon)
         sid = journal.log_signal(
             coin=sig.coin, direction=sig.direction, confidence=sig.confidence,
             magnitude=sig.magnitude, leverage=leverage, entry=entry,
             headline=sig.event.text, rationale=sig.rationale, tape_note=tape_note,
-            horizon=sig.horizon,
+            horizon=sig.horizon, stop=stop,
         )
-        stop = notifier.stop_price(entry, sig.direction, leverage)
         pid = executor.register(
             signal_id=sid, coin=sig.coin, label=market.label,
             direction=sig.direction, entry_ref=entry, stop=stop,

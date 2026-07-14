@@ -33,8 +33,8 @@ WALLET_ADDRESS = _opt("WALLET_ADDRESS")
 HL_AGENT_PRIVATE_KEY = _opt("HL_AGENT_PRIVATE_KEY")
 
 # --- Execution guardrails (semi-auto mode) -----------------------------------
-TOTAL_BANKROLL = 17.5           # USD total margin budget across ALL open trades
-                                # (live 2026-07-14: $17.71 deposited, small buffer)
+TOTAL_BANKROLL = 40.0           # USD total margin budget across ALL open trades
+                                # (raised 2026-07-14 from $17.5 as account grew)
 MIN_MARGIN_PER_TRADE = 2.0      # below this leftover, skip rather than dust in
                                 # ($2 @ 5x = $10 notional, the exchange minimum)
 MAX_CONCURRENT_POSITIONS = 3    # bot won't open a 4th
@@ -100,6 +100,47 @@ MARKET_BY_COIN = {m.coin: m for m in MARKETS}
 DEFAULT_LEVERAGE = 20   # scalp tier: hold minutes-hours, flat same session
 SWING_LEVERAGE = 5      # swing tier: multi-day holds need liq 20%+ away
 
+# --- Stop/target geometry (fixed %, NOT leverage-derived) ---------------------
+# Replaces the old "half the liquidation distance" formula (0.5/leverage,
+# i.e. 2.5% for a 20x scalp / 10% for a 5x swing): the geometry backtest
+# (backtests/RESULTS.md) found those targets essentially unreachable in the
+# tier's own hold window (scalp needed 5% raw in <4h, swing needed 20% raw in
+# 3 days). New: scalp 0.5% stop / 1.0% target (2R), swing 3% stop / 6% target
+# (2R) — target is still computed as 2R via watcher.target_price(), so only
+# the stop fraction needs to change here. Applies to NEW entries only — an
+# already-open trade keeps whatever stop was frozen into journal.signals.stop
+# at its own entry time; see notifier.resolve_stop().
+SCALP_STOP_RAW = 0.005
+SWING_STOP_RAW = 0.03
+
+# --- News-tier entry quality gates (2026-07-14, from live-trade review) --------
+# Floors raised from scalp 0.5/0.3 + swing 0.6/0.4: every fired trade was
+# hugging the old minimums, and the one that lost (MU short, conf 0.60) sat
+# exactly on the swing floor while the one that won (NVDA, conf 0.65) cleared
+# it. 0.65/0.40 keeps the winner and rejects the floor-huggers. With ~99% of
+# signals already rejected by slots/tape, the few that trade should be the
+# best few — capacity is the scarce resource, not ideas.
+SCALP_MIN_CONF = 0.65
+SCALP_MIN_MAG = 0.40
+SWING_MIN_CONF = 0.65
+SWING_MIN_MAG = 0.40
+
+# Never fade a strong same-day move: the 30s tape window is blind to daily
+# trend (it read "flat" while MU was +6.7% on the day and let a short through
+# on a misread headline). Blocks any news entry AGAINST a day move >= this %.
+TREND_FILTER_PCT = 3.0
+
+# Index scalps scratched or bled all session (recap headlines aren't
+# catalysts; 20x round-trip fees eat the scratches). Scalp tier is single
+# names only; swing on indexes stays allowed (macro theses are real).
+SCALP_EXCLUDE = {"xyz:XYZ100", "xyz:SP500"}
+
+# Scalps must play out in liquid hours: the losing MU short opened 05:20 ET
+# into a thin pre-market book and drifted to the 4h clock. Stock/index scalps
+# only during NYSE RTH; BTC (natively 24/7) is exempt. Swings are exempt too —
+# multi-day holds aren't hostage to the entry hour's liquidity.
+SCALP_RTH_ONLY = True
+
 # --- Earnings run-up tier (backtested: +1.59%/event net, 62% win, 10y; see
 # backtests/RESULTS.md — at 5x: +10.6% EV on margin, 1% liquidation risk) ----
 # Toggle via RUNUP_ENABLED in .env (user can hand earnings back to manual).
@@ -139,9 +180,10 @@ NEWS_EXIT_MIN_MAG = 0.60
 # Shares recompute off the LIVE bankroll, so tiers that win grow their own
 # budgets and tiers that lose shrink — allocation self-adjusts with results.
 TIER_BUDGET_FRAC = {"runup": 0.50, "swing": 0.30, "scalp": 0.20}
-# one slot per news tier at the $17.5 live bankroll — a $2.60 half-slot would
-# sit under the exchange's $10 minimum notional at 5x
-TIER_MAX_CONCURRENT = {"runup": 2, "swing": 1, "scalp": 1}
+# swing gets a 2nd slot at the $40 bankroll ($12 share -> $6 slots, $30
+# notional at 5x, comfortably over the exchange's $10 minimum); scalp stays
+# at 1 — weakest tier, hasn't earned more concurrency yet
+TIER_MAX_CONCURRENT = {"runup": 2, "swing": 2, "scalp": 1}
 # per-name backtested mean net return per run-up event (% notional, 10y)
 RUNUP_EDGE = {
     "xyz:AMD": 2.72, "xyz:MU": 2.54, "xyz:NVDA": 2.34, "xyz:GOOGL": 2.02,
@@ -161,7 +203,17 @@ TAKER_FEE = 0.00045             # 0.045% of notional per side (market orders)
 ROUND_TRIP_FEE = 2 * TAKER_FEE  # entry + exit; as fraction of notional
 
 # --- Tuning ------------------------------------------------------------------
-NEWS_POLL_SECONDS = 90          # how often the Perplexity poller runs
+NEWS_POLL_SECONDS = 120         # how often the Perplexity poller runs (was 90;
+                                # raised to cut Sonar credits ~25% — worst-case
+                                # 2min news latency, and scalps are RTH-only now)
+# Dedup: Perplexity re-serves one story reworded for hours (observed 19x/day
+# for a single story) — each rewording used to cost a full Haiku call.
+NEWS_DEDUP_WINDOW_S = 2700      # 45 min: how long a seen story suppresses lookalikes
+NEWS_DEDUP_SIM = 0.75           # overlap coefficient (∩ ÷ smaller set) to count
+                                # as the same story — 61% of headlines on the
+                                # measured day; escalations of a story within the
+                                # window are also suppressed, acceptable since
+                                # ALERT_COOLDOWN gates same-thesis re-alerts anyway
 TAPE_WINDOW_SECONDS = 30        # rolling window for trade-flow momentum
 BOOK_IMBALANCE_THRESHOLD = 0.65 # fraction of top-of-book depth on one side
 ALERT_COOLDOWN_SECONDS = 1800   # min gap between alerts for same coin+direction

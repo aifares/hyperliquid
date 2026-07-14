@@ -33,9 +33,26 @@ SHADOW_MODE = os.getenv("SHADOW_MODE", "0") == "1"
 
 
 async def _analyzer_loop(queue: "asyncio.Queue[NewsEvent]", stream: HLStream) -> None:
+    import prefilter
     analyzer = Analyzer()
+    last_stats = 0.0
     while True:
         ev = await queue.get()
+        # Rewordings of an already-analyzed story never reach the API — the
+        # first telling was scored minutes ago and cooldowns gate repeats
+        # downstream anyway. Saves ~1/3 of Haiku spend (measured 2026-07-14).
+        if prefilter.is_duplicate(ev.text):
+            prefilter.skipped_dup += 1
+            print(f"[prefilter] dup skipped: {ev.text[:70]!r}")
+            continue
+        prefilter.analyzed += 1
+        import time as _time
+        if _time.time() - last_stats > 3600 and prefilter.analyzed > 0:
+            last_stats = _time.time()
+            total = prefilter.analyzed + prefilter.skipped_dup
+            print(f"[prefilter] api usage: {prefilter.analyzed} analyzed, "
+                  f"{prefilter.skipped_dup} dups skipped "
+                  f"({prefilter.skipped_dup / total * 100:.0f}% saved)")
         sig = await analyzer.analyze(ev)
         print(f"[analyze] {ev.source}: {ev.text[:70]!r}\n"
               f"          -> {sig.coin} {sig.direction} "

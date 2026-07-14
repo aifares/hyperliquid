@@ -99,10 +99,10 @@ class NewsSignal:
         if self.direction not in ("long", "short") or self.coin not in config.MARKET_BY_COIN:
             return False
         if self.horizon == "swing":
-            # Swing rides a multi-day thesis: demand more conviction from the
-            # news itself since instantaneous tape matters less.
-            return self.confidence >= 0.6 and self.magnitude >= 0.4
-        return self.confidence >= 0.5 and self.magnitude >= 0.3
+            return (self.confidence >= config.SWING_MIN_CONF
+                    and self.magnitude >= config.SWING_MIN_MAG)
+        return (self.confidence >= config.SCALP_MIN_CONF
+                and self.magnitude >= config.SCALP_MIN_MAG)
 
 
 def _positions_context() -> str:

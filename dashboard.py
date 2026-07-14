@@ -127,7 +127,7 @@ def open_positions(mids: dict[str, float],
     rows have no real position to match, so they're rendered separately using
     the fire-time entry + live mid."""
     rows = query(
-        "SELECT id, ts, coin, direction, horizon, leverage, entry, dry_run "
+        "SELECT id, ts, coin, direction, horizon, leverage, entry, dry_run, stop "
         "FROM signals WHERE executed=1 AND (exit_reason IS NULL OR exit_reason = '') "
         "ORDER BY ts DESC")
     journal_by_coin: dict[str, tuple] = {}
@@ -142,14 +142,18 @@ def open_positions(mids: dict[str, float],
     total_upnl = 0.0
     rendered = 0
 
-    def _emit(sid, ts, coin, d, hz, lev, entry, now, raw, roe, upnl, exec_label) -> None:
+    def _emit(sid, ts, coin, d, hz, lev, entry, stored_stop, now, raw, roe, upnl,
+             exec_label) -> None:
         nonlocal total_upnl, rendered
         if hz == "runup":
             stop, tgt_display = entry * (1 - config.RUNUP_STOP_RAW), "📅"
         elif hz == "manual":
             stop, tgt_display = 0.0, "—"
         else:
-            stop = notifier.stop_price(entry, d, lev)
+            # The ACTUAL resting stop (frozen at entry, or the legacy formula
+            # for a pre-fix row) — never a fresh recompute, or this would show
+            # a number that doesn't match what's really on the exchange.
+            stop = notifier.resolve_stop(entry, d, lev, hz, stored_stop)
             tgt_display = f"{watcher.target_price(entry, stop, d):g}"
         total_upnl += upnl
         rendered += 1
@@ -169,24 +173,25 @@ def open_positions(mids: dict[str, float],
         upnl = float(pos["unrealizedPnl"])
         row = journal_by_coin.get(coin)
         if row:
-            sid, ts, _, d, hz, lev, _je, dry = row
+            sid, ts, _, d, hz, lev, _je, dry, stored_stop = row
             exec_label = Text("SIM", style="dim") if dry else Text("LIVE", style="bold red")
         else:  # fully manual — no bot thesis, display-only
-            sid, ts, hz, dry = "—", None, "manual", 0
+            sid, ts, hz, dry, stored_stop = "—", None, "manual", 0, None
             d = "long" if szi > 0 else "short"
             lev = int((pos.get("leverage") or {}).get("value", 0)) or 1
             exec_label = Text("LIVE", style="dim")
         raw = (now - entry) / entry * 100 * (1 if d == "long" else -1)
-        _emit(sid, ts, coin, d, hz, lev, entry, now, raw, roe, upnl, exec_label)
+        _emit(sid, ts, coin, d, hz, lev, entry, stored_stop, now, raw, roe, upnl, exec_label)
 
     # Secondary: pure paper (dry-run) rows — never in `positions` by
     # definition, so keep the old fire-time-entry + live-mid method.
-    for sid, ts, coin, d, hz, lev, entry, dry in rows:
+    for sid, ts, coin, d, hz, lev, entry, dry, stored_stop in rows:
         if not dry or coin in positions:
             continue
         now = mids.get(coin, 0.0)
         raw, roe = journal.trade_pnl_pct(d, entry, now, lev) if now else (0.0, 0.0)
-        _emit(sid, ts, coin, d, hz, lev, entry, now, raw, roe, 0.0, Text("SIM", style="dim"))
+        _emit(sid, ts, coin, d, hz, lev, entry, stored_stop, now, raw, roe, 0.0,
+             Text("SIM", style="dim"))
 
     if not rendered:
         t.add_row(*["—"] * 14)

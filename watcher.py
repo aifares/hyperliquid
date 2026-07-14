@@ -111,7 +111,12 @@ async def watch(*, signal_id: int, coin: str, label: str, direction: str,
                       f"— recomputing stop/target off the real position")
                 entry = live_pos.entry
                 leverage = live_pos.leverage or leverage
-                stop = notifier.stop_price(entry, direction, leverage)
+                # A resize is itself a new event — the original entry/stop
+                # relationship no longer applies regardless of whether this
+                # trade predates the geometry fix, so recompute fresh here
+                # (unlike resume_live, which must preserve a pre-fix trade's
+                # frozen stop across a plain restart).
+                stop = notifier.stop_price(entry, direction, horizon)
                 tgt = target_price(entry, stop, direction)
                 risk = abs(entry - stop)
 
@@ -177,15 +182,19 @@ def resume_live(stream: HLStream) -> int:
     the LIVE position when the cache already has data (not just the
     journal's stale snapshot), so a manual resize between the last shutdown
     and this restart is reflected immediately rather than waiting for the
-    first in-loop reconcile tick."""
+    first in-loop reconcile tick. The STOP is resolved via
+    notifier.resolve_stop() — its own frozen value from entry time, or the
+    legacy formula for a pre-fix row — never recomputed from today's config,
+    so a geometry change (SCALP_STOP_RAW/SWING_STOP_RAW) never retroactively
+    moves a stop under a position that's already open."""
     n = 0
-    for sid, coin, direction, horizon, lev, entry, ts in journal.open_live_rows():
+    for sid, coin, direction, horizon, lev, entry, ts, stored_stop in journal.open_live_rows():
         label = config.MARKET_BY_COIN[coin].label if coin in config.MARKET_BY_COIN else coin
         live_pos = account_monitor.get(coin) if account_monitor.has_polled() else None
         if live_pos:
             entry = live_pos.entry or entry
             lev = live_pos.leverage or lev
-        stop = notifier.stop_price(entry, direction, lev)
+        stop = notifier.resolve_stop(entry, direction, lev, horizon, stored_stop)
         asyncio.create_task(watch(
             signal_id=sid, coin=coin, label=label, direction=direction,
             entry=entry, stop=stop, horizon=horizon, leverage=lev, stream=stream,
