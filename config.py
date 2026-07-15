@@ -87,6 +87,9 @@ MARKETS: list[Market] = [
            ("micron", "mu", "dram", "hbm", "memory chips", "nand")),
     Market("xyz:INTC", "Intel", 10,
            ("intel", "intc", "foundry", "x86")),
+    Market("xyz:HOOD", "Robinhood", 10,
+           ("robinhood", "hood", "vlad tenev", "retail brokerage",
+            "retail trading", "commission-free")),
     Market("xyz:XYZ100", "Nasdaq-100 (XYZ100)", 30,
            ("nasdaq", "ndx", "xyz100", "tech stocks", "qqq", "cpi", "fed",
             "rate", "inflation", "jobs report", "fomc")),
@@ -149,7 +152,10 @@ RUNUP_LEVERAGE = 5
 RUNUP_ENTRY_TDAYS = 10          # trading days before the print to enter
 RUNUP_STOP_RAW = 0.03           # -3% raw = -15% on margin hard stop
 RUNUP_MAX_CONCURRENT = 2        # own cap (was 4; shrunk for the $17.5 bankroll)
-RUNUP_EXCLUDE = {"xyz:TSLA"}    # negative run-up expectancy in backtest
+RUNUP_EXCLUDE = {"xyz:TSLA",    # negative run-up expectancy in backtest
+                 "xyz:HOOD"}    # never backtested for run-up (added to MARKETS
+                                # 2026-07-14 only for news monitoring of the
+                                # user's manual position) — validate before funding
 
 # News-veto exit: bail a held run-up EARLY if a genuinely bad, high-conviction
 # catalyst lands on that exact ticker — before the -3% price stop would trip.
