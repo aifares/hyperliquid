@@ -164,6 +164,20 @@ def coin_direction_conflict(coin: str, direction: str) -> str | None:
     return None
 
 
+def bigswing_active() -> bool:
+    """True if the full-balance bigswing tier currently holds an open
+    position. Checked directly against the journal (not bigswing.py's
+    in-memory state) to avoid a circular import — bigswing.py imports this
+    module, so this module must not import bigswing.py back."""
+    if not config.BIGSWING_PAUSE_OTHER_TIERS:
+        return False
+    with journal._conn() as c:  # noqa: SLF001
+        row = c.execute(
+            "SELECT 1 FROM signals WHERE horizon='bigswing' AND executed=1 "
+            "AND (exit_reason IS NULL OR exit_reason='') LIMIT 1").fetchone()
+    return row is not None
+
+
 def guardrail_block(tier: str = "scalp") -> str | None:
     """Return a human reason if trading is currently blocked, else None.
     Kill switch and real-margin check are global; concurrency and budget are
@@ -171,6 +185,14 @@ def guardrail_block(tier: str = "scalp") -> str | None:
     if losses_today() >= config.DAILY_LOSS_LIMIT:
         return (f"🛑 KILL SWITCH: {config.DAILY_LOSS_LIMIT} stopped-out trades "
                 f"today. Halted until midnight ET.")
+    # bigswing claims ~the whole account for its single open position — the
+    # scalp/swing/runup tiers must not also place real orders against the
+    # same wallet while it's holding one, or they'd be fighting over margin
+    # bigswing already committed.
+    if tier != "bigswing" and bigswing_active():
+        return ("⛔ bigswing holds an open full-balance position — other "
+                "tiers stay paused so they don't compete for the same real "
+                "margin.")
     # The bot's own tier-budget math can say "plenty of room" while the real
     # exchange account has nothing free (e.g. a manual trade parked margin
     # the bot's own tracking never sees) — check REAL spot balance before
@@ -288,9 +310,14 @@ def _exchange():
     from hyperliquid.utils import constants
 
     wallet = Account.from_key(config.HL_AGENT_PRIVATE_KEY)
+    # perp_dexs=["xyz"] ALONE excludes the default dex ("") from the SDK's
+    # internal name_to_coin/coin_to_asset maps (see hyperliquid/info.py:
+    # perp_dexs=None -> [""], but an explicit list is used AS GIVEN, no
+    # implicit ""). BTC lives on the default dex, not xyz — omitting "" here
+    # made every order/cancel/leverage call on BTC fail with KeyError('BTC').
     return Exchange(wallet, constants.MAINNET_API_URL,
                     account_address=config.WALLET_ADDRESS or None,
-                    perp_dexs=["xyz"])
+                    perp_dexs=["", "xyz"])
 
 
 def _place_bracket_sync(pt: PendingTrade, sz: float, margin: float) -> str:
@@ -353,6 +380,106 @@ def place_runup_entry_sync(coin: str, sz: float, leverage: int, stop: float) -> 
     return "filled ✅ server-side stop resting."
 
 
+def guardrail_block_bigswing() -> str | None:
+    """Guardrails for the full-balance tier: the kill switch is shared, but
+    there's no tier budget/concurrency cap here — the ONE-position-at-a-time
+    rule and per-coin conflict check are enforced by bigswing.py itself
+    (against the live exchange state) before this is ever reached."""
+    if losses_today() >= config.DAILY_LOSS_LIMIT:
+        return (f"🛑 KILL SWITCH: {config.DAILY_LOSS_LIMIT} stopped-out trades "
+                f"today. Halted until midnight ET.")
+    return None
+
+
+async def execute_bigswing(*, coin: str, label: str, direction: str,
+                           entry_ref: float, stop: float, target: float,
+                           leverage: int, margin: float) -> tuple[str, int | None]:
+    """Full-balance entry for the bigswing tier: same bracket mechanics as
+    execute(), but `margin` is passed in directly (bigswing derives it from
+    account_monitor.spot_available(), NOT allocate_margin's tier-fraction
+    slot) since bigswing claims ~the whole account for its single open
+    position. Returns (status message, signal_id) — signal_id is None if
+    nothing was actually opened (blocked, zero size, or the order failed),
+    so the caller knows not to treat the bigswing slot as occupied."""
+    block = guardrail_block_bigswing()
+    if block:
+        return block, None
+
+    await _load_sz_decimals()
+    sz = position_size(coin, entry_ref, leverage, margin)
+    if sz <= 0:
+        return f"⚠️ Computed size is 0 for {coin} — margin too small for the price.", None
+    notional = sz * entry_ref
+    pt = PendingTrade(
+        id="bigswing", signal_id=0, coin=coin, label=label, direction=direction,
+        entry_ref=entry_ref, stop=stop, target=target, leverage=leverage,
+        horizon="bigswing", confidence=1.0, created=time.time(),
+    )
+
+    if DRY_RUN:
+        sid = journal.log_signal(
+            coin=coin, direction=direction, confidence=1.0, magnitude=1.0,
+            leverage=leverage, entry=entry_ref, headline="bigswing technical entry",
+            rationale="full-balance swing entry", tape_note="", horizon="bigswing",
+            stop=stop)
+        journal.mark_executed(sid, dry_run=True, margin=margin)
+        return (f"🧪 DRY RUN — would place: {direction.upper()} {sz} {coin} "
+                f"(~${notional:,.0f} notional, ${margin:.2f} margin @ {leverage}x)\n"
+                f"+ stop @ {stop:,.4g} + target @ {target:,.4g} (reduce-only, "
+                f"server-side)"), sid
+
+    try:
+        result = await asyncio.to_thread(_place_bracket_sync, pt, sz, margin)
+    except Exception as e:  # noqa: BLE001 — no order placed, nothing to journal
+        return f"❌ Order failed: {e!r}", None
+
+    sid = journal.log_signal(
+        coin=coin, direction=direction, confidence=1.0, magnitude=1.0,
+        leverage=leverage, entry=entry_ref, headline="bigswing technical entry",
+        rationale="full-balance swing entry", tape_note="", horizon="bigswing",
+        stop=stop)
+    journal.mark_executed(sid, dry_run=False, margin=margin)
+    return result, sid
+
+
+def attach_bracket_sync(coin: str, direction: str, sz: float, stop: float,
+                        target: float) -> str:
+    """Place reduce-only stop+target brackets on a position that ALREADY
+    exists on the exchange — bigswing's manual-adoption path. Mirrors the
+    tail half of _place_bracket_sync but skips the entry order entirely."""
+    ex = _exchange()
+    is_buy = direction == "long"
+    stop_px = round_px(coin, stop)
+    tgt_px = round_px(coin, target)
+    notes = []
+    stop_o = ex.order(coin, not is_buy, sz, stop_px,
+                      {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}},
+                      reduce_only=True)
+    if stop_o.get("status") != "ok":
+        notes.append(f"⚠️ stop order rejected: {stop_o}")
+    tp_o = ex.order(coin, not is_buy, sz, tgt_px,
+                    {"trigger": {"triggerPx": tgt_px, "isMarket": True, "tpsl": "tp"}},
+                    reduce_only=True)
+    if tp_o.get("status") != "ok":
+        notes.append(f"⚠️ target order rejected: {tp_o}")
+    return "; ".join(notes) if notes else "✅ stop + target attached to existing position."
+
+
+def has_resting_stop(coin: str) -> bool:
+    """True if the account already has a resting reduce-only trigger order on
+    `coin` — used by bigswing's adoption path so it doesn't double-bracket a
+    manual position where the user already set their own stop."""
+    try:
+        from hyperliquid.info import Info
+        from hyperliquid.utils import constants
+        info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", "xyz"])
+        orders = info.open_orders(config.WALLET_ADDRESS)
+        return any(o.get("coin") == coin for o in orders)
+    except Exception as e:  # noqa: BLE001 — assume none rather than block adoption
+        print(f"[executor] has_resting_stop check failed for {coin}: {e!r}")
+        return False
+
+
 def close_position_sync(coin: str) -> str:
     """Live close: market-close the whole position and cancel resting orders
     (the run-up's server-side stop). Safe if the stop already fired."""
@@ -369,7 +496,7 @@ def close_position_sync(coin: str) -> str:
     try:
         from hyperliquid.info import Info
         from hyperliquid.utils import constants
-        info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["xyz"])
+        info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", "xyz"])
         for o in info.open_orders(config.WALLET_ADDRESS):
             if o.get("coin") == coin:
                 ex.cancel(coin, o["oid"])

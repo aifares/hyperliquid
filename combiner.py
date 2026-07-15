@@ -45,6 +45,15 @@ def _burst_ok() -> bool:
     return len(_recent_alerts) < config.ALERT_BURST_MAX
 
 
+def latest_read(coin: str) -> dict | None:
+    """The most recent actionable Claude news read for `coin` (any
+    tier/outcome), or None. Backs the reversal guard above; also reused by
+    bigswing.py as a SECONDARY confirm/veto on its own technical/orderbook
+    signal — bigswing never leads with news, but a strongly opposing recent
+    read still blocks an entry."""
+    return _signal_ledger.get(coin)
+
+
 async def handle_signal(sig: NewsSignal, stream: HLStream) -> None:
     """Called for every analyzed news item."""
     if not sig.actionable:

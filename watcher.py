@@ -16,6 +16,7 @@ import account_monitor
 import config
 import executor
 import journal
+import market_hours
 import notifier
 import tape
 from hl_stream import HLStream
@@ -29,6 +30,7 @@ def _live_executed(signal_id: int) -> bool:
 
 SCALP_MAX_HOLD_S = 4 * 3600
 SWING_MAX_HOLD_S = 72 * 3600
+BIGSWING_MAX_HOLD_S = config.BIGSWING_MAX_HOLD_HOURS * 3600
 POLL_S = 2.0
 RECONCILE_S = 10.0       # how often to re-check the REAL position (live trades
                          # only — matches account_monitor's own poll cadence,
@@ -36,8 +38,8 @@ RECONCILE_S = 10.0       # how often to re-check the REAL position (live trades
 FADE_STRENGTH = 0.6      # opposing tape strength that counts as momentum death
 # FADE must not scratch trades seconds after entry on tape flicker: require a
 # minimum hold AND a minimum profit (in R = stop distance) before it can fire.
-FADE_MIN_HOLD_S = {"scalp": 180, "swing": 3600}
-FADE_MIN_PROFIT_R = {"scalp": 0.5, "swing": 1.0}
+FADE_MIN_HOLD_S = {"scalp": 180, "swing": 3600, "bigswing": 3600}
+FADE_MIN_PROFIT_R = {"scalp": 0.5, "swing": 1.0, "bigswing": 1.0}
 
 _veto: dict[str, dict] = {}   # coin -> {"conf","mag","headline","ts"} armed early-exit
 
@@ -60,18 +62,31 @@ def flag_bearish(coin: str, confidence: float, magnitude: float, headline: str) 
     return True
 
 
-def target_price(entry: float, stop: float, direction: str) -> float:
-    """2R target: twice the stop distance, in the trade's favor."""
+def target_price(entry: float, stop: float, direction: str, r_mult: float = 2.0) -> float:
+    """R-multiple target (default 2R): r_mult times the stop distance, in
+    the trade's favor. r_mult is only ever overridden by the bigswing tier
+    (config.BIGSWING_TARGET_R) — scalp/swing keep the default 2R."""
     risk = abs(entry - stop)
-    return entry + 2 * risk if direction == "long" else entry - 2 * risk
+    return entry + r_mult * risk if direction == "long" else entry - r_mult * risk
 
 
 async def watch(*, signal_id: int, coin: str, label: str, direction: str,
                 entry: float, stop: float, horizon: str, leverage: int,
-                stream: HLStream, opened: float | None = None) -> None:
-    tgt = target_price(entry, stop, direction)
+                stream: HLStream, opened: float | None = None,
+                equity_baseline: float | None = None) -> None:
+    """equity_baseline is bigswing-only: the account equity snapshot at
+    entry/adoption time, used by the hard equity safety net below. Ignored
+    for scalp/swing/runup."""
+    r_mult = config.BIGSWING_TARGET_R if horizon == "bigswing" else 2.0
+    tgt = target_price(entry, stop, direction, r_mult)
     opened = opened or time.time()
-    deadline = opened + (SCALP_MAX_HOLD_S if horizon == "scalp" else SWING_MAX_HOLD_S)
+    if horizon == "scalp":
+        max_hold = SCALP_MAX_HOLD_S
+    elif horizon == "bigswing":
+        max_hold = BIGSWING_MAX_HOLD_S
+    else:
+        max_hold = SWING_MAX_HOLD_S
+    deadline = opened + max_hold
     long = direction == "long"
     risk = abs(entry - stop)
     # A paper position has no real order to reconcile against — this whole
@@ -117,16 +132,42 @@ async def watch(*, signal_id: int, coin: str, label: str, direction: str,
                 # (unlike resume_live, which must preserve a pre-fix trade's
                 # frozen stop across a plain restart).
                 stop = notifier.stop_price(entry, direction, horizon)
-                tgt = target_price(entry, stop, direction)
+                tgt = target_price(entry, stop, direction, r_mult)
                 risk = abs(entry - stop)
 
         if reason is None:
             if mid <= 0:
                 continue
-            if (long and mid <= stop) or (not long and mid >= stop):
+            profit = (mid - entry) if long else (entry - mid)
+
+            # --- bigswing-only guardrails (checked ahead of the normal
+            # stop/target so they act as an override, not an afterthought) --
+            equity_now = None
+            if (horizon == "bigswing" and equity_baseline
+                    and account_monitor.has_polled()):
+                equity_now = account_monitor.account_value()
+
+            if (equity_now is not None and equity_now > 0
+                    and equity_now <= equity_baseline * (1 - config.BIGSWING_EQUITY_STOP_PCT)):
+                reason, emoji, note = "EQUITY_STOP", "🚨", (
+                    f"Hard equity safety net: account equity ${equity_now:,.2f} is "
+                    f"at/below the floor ${equity_baseline * (1 - config.BIGSWING_EQUITY_STOP_PCT):,.2f} "
+                    f"({config.BIGSWING_EQUITY_STOP_PCT*100:.0f}% down from the "
+                    f"${equity_baseline:,.2f} snapshot at entry) — force-closing NOW, "
+                    f"independent of the resting price stop, in case a gap jumped "
+                    f"past it or the trigger order failed.")
+            elif (long and mid <= stop) or (not long and mid >= stop):
                 reason, emoji, note = "STOP", "🛑", "Stop hit — exit now, thesis invalidated."
             elif (long and mid >= tgt) or (not long and mid <= tgt):
                 reason, emoji, note = "TARGET", "🎯", "2R target reached — take profit / trail the rest."
+            elif (horizon == "bigswing" and coin.startswith("xyz:")
+                  and market_hours.closing_soon() and profit < risk):
+                reason, emoji, note = "OFFHOURS_DERISK", "🌙", (
+                    "Market closing soon and this trade isn't up >=1R yet — "
+                    "flattening rather than holding a full-balance position "
+                    "through an overnight/weekend gap (your own backtest "
+                    "flags repeated overnight holds at this size/leverage as "
+                    "not survivable; see backtests/RESULTS.md).")
             elif coin in _veto:
                 v = _veto.pop(coin)
                 reason, emoji, note = "NEWS", "📰", (
@@ -140,7 +181,7 @@ async def watch(*, signal_id: int, coin: str, label: str, direction: str,
             else:
                 # momentum fade: only exits a trade with real profit banked after a
                 # real hold; losers are the stop's job, scratches are noise
-                profit = (mid - entry) if long else (entry - mid)
+                # (profit already computed above, ahead of the bigswing checks)
                 enough_profit = profit >= FADE_MIN_PROFIT_R[horizon] * risk
                 held_enough = (time.time() - opened) >= FADE_MIN_HOLD_S[horizon]
                 tsig = tape.analyze(st)

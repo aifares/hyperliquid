@@ -53,6 +53,14 @@ def get(coin: str) -> Position | None:
     return LIVE.get(coin)
 
 
+def untracked_coins(claimed: set[str]) -> list[str]:
+    """Coins with a live exchange position that ISN'T in `claimed` (e.g.
+    every coin already claimed by an open journal row, any tier) — used by
+    bigswing.py to detect a manually-opened position it should consider
+    adopting. Read-only: never modifies LIVE."""
+    return [c for c in LIVE if c not in claimed]
+
+
 def account_value() -> float:
     """Live exchange equity — for display/monitoring, NOT the sizing ceiling
     (that's config.TOTAL_BANKROLL, a hardcoded number the user edits directly)."""

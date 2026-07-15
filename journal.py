@@ -146,15 +146,19 @@ def all_held_positions() -> list[tuple[str, str, str]]:
 
 
 def open_live_rows() -> list[tuple]:
-    """Real (dry_run=0), non-runup positions still open in the journal —
+    """Real (dry_run=0), scalp/swing positions still open in the journal —
     these have a genuine order + resting stop/target on the exchange and
     must be resumed with a watcher on restart, never force-closed. Includes
     the stop FROZEN at entry time (NULL for legacy rows opened before that
-    column existed) so a restart can't silently apply a newer geometry."""
+    column existed) so a restart can't silently apply a newer geometry.
+    Excludes 'runup' (own resume in earnings_runup._resume) AND 'bigswing'
+    (own resume in bigswing._resume, which also needs to reconstruct the
+    equity-safety-net baseline — watcher.resume_live() has no concept of
+    that, so it must never touch a bigswing row)."""
     with _conn() as c:
         return c.execute(
             "SELECT id, coin, direction, horizon, leverage, entry, ts, stop FROM signals "
-            "WHERE executed=1 AND dry_run=0 AND horizon != 'runup' "
+            "WHERE executed=1 AND dry_run=0 AND horizon NOT IN ('runup', 'bigswing') "
             "AND (exit_reason IS NULL OR exit_reason='')").fetchall()
 
 

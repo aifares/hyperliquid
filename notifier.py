@@ -24,12 +24,18 @@ def liquidation_price(entry: float, direction: str, leverage: int) -> float:
 
 
 def stop_price(entry: float, direction: str, horizon: str = "scalp") -> float:
-    """Fixed-% stop by tier (config.SCALP_STOP_RAW / SWING_STOP_RAW) — for a
-    BRAND NEW entry only. An already-open trade's own stop is frozen in
-    journal.signals.stop at entry time; use resolve_stop() to read it back
-    rather than recomputing here, or a later config edit would silently
-    retighten/loosen a position that's already live."""
-    frac = config.SWING_STOP_RAW if horizon == "swing" else config.SCALP_STOP_RAW
+    """Fixed-% stop by tier (config.SCALP_STOP_RAW / SWING_STOP_RAW /
+    BIGSWING_STOP_RAW) — for a BRAND NEW entry only. An already-open trade's
+    own stop is frozen in journal.signals.stop at entry time; use
+    resolve_stop() to read it back rather than recomputing here, or a later
+    config edit would silently retighten/loosen a position that's already
+    live."""
+    if horizon == "swing":
+        frac = config.SWING_STOP_RAW
+    elif horizon == "bigswing":
+        frac = config.BIGSWING_STOP_RAW
+    else:
+        frac = config.SCALP_STOP_RAW
     if direction == "long":
         return entry * (1 - frac)
     return entry * (1 + frac)

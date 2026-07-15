@@ -199,6 +199,99 @@ RUNUP_EDGE = {
 RUNUP_EDGE_MEAN = sum(RUNUP_EDGE.values()) / len(RUNUP_EDGE)   # ≈1.80
 
 
+# --- Full-balance swing tier ("bigswing") -------------------------------------
+# Standalone strategy: ONE position at a time, sized off nearly the full LIVE
+# account balance (account_monitor.spot_available(), NOT the TOTAL_BANKROLL
+# fractional pool the other tiers share), long or short, leverage scaled 5x-10x
+# by a technical/orderbook conviction score (swing_signals.py) rather than the
+# news+tape combiner. News is a secondary confirm/veto only (see bigswing.py).
+#
+# IMPORTANT — read backtests/RESULTS.md "All-in single-stock strategy" section
+# before funding this for real: that study found the aspirational return
+# target ("+15-20%/trade, full balance, repeat") UNSUPPORTED, and flagged
+# 10x+ held overnight, repeated, as NOT SURVIVABLE (gaps >=10% happen ~1/261
+# sessions/name). The overnight de-risk rule and hard equity stop below exist
+# specifically to address that finding — do not remove them to "size up".
+BIGSWING_ENABLED = _opt("BIGSWING_ENABLED", "0") == "1"
+# Curated focus list + stop/conviction, VALIDATED by backtests/bigswing_bt.py
+# (2026-07-15) — that script backtests the ACTUAL swing_signals.py entry
+# logic (trend-slope + Donchian breakout; the sustained order-book-imbalance
+# and liquidation-pressure votes aren't in daily-bar history, so they're
+# untested here — see the module docstring) over 10y of daily bars per name,
+# net of friction, WITH the real overnight de-risk mechanics simulated
+# (fires ~50-70% of the time on these names — most stock-perp trades resolve
+# in ~1-2 days, only BTC reliably runs multi-day; re-read the chat/RESULTS.md
+# before assuming a longer typical hold). One-slot-across-all-coins portfolio
+# sim on this curated set: ~82 trades/yr, 48.8% win, +0.35%/trade net raw
+# (≈+1.8% to +3.5% equity at 5-10x) — small and repeatable, not a home run,
+# consistent with every other tier's validated edge in this repo.
+#   BTC       — 24/7, exempt from the overnight de-risk flatten (the ONLY name
+#               here that can genuinely run the full multi-day swing/max hold);
+#               backtested net +0.57%/trade, best of the set
+#   xyz:HOOD  — backtested net +0.36%/trade (2nd best); requested addition
+#   xyz:MU    — backtested net +0.11-0.22%/trade; best liquidity/OI of the
+#               stock book ($270M/$185M); requested addition ("DRAM")
+#   xyz:AMD   — backtested net +0.16-0.18%/trade
+#   xyz:NVDA  — backtested net ~+0.07%/trade (thin edge, kept for liquidity)
+#   xyz:TSLA  — backtested net +0.30-0.49%/trade on THIS signal (re-added:
+#               the run-up tier's TSLA exclusion was a DIFFERENT strategy/
+#               signal and does not transfer here)
+# Dropped vs the prior list: xyz:META backtested NEGATIVE on this signal
+# (-0.14% to -0.16%/trade); also excluded for the same reason: xyz:INTC,
+# xyz:MSFT, xyz:AMZN (all net-negative-to-flat), xyz:GOOGL/xyz:AAPL (net
+# ~flat, too thin to bother with in a one-slot-at-a-time design).
+BIGSWING_MARKETS = [m for m in MARKETS if m.coin in
+                    {"BTC", "xyz:HOOD", "xyz:MU", "xyz:AMD", "xyz:NVDA", "xyz:TSLA"}]
+BIGSWING_MIN_LEVERAGE = 5
+BIGSWING_MAX_LEVERAGE = 10
+BIGSWING_MIN_CONVICTION = 0.4                 # backtest sweep: 0.4 beat both 0.5
+                                               # (prior default) and 0.3 net of
+                                               # friction on the curated markets
+BIGSWING_BTC_MIN_CONVICTION = 0.7             # BTC gets a HIGHER bar than the
+                                               # stock names (requested 2026-07-15):
+                                               # only trade it on a genuinely
+                                               # high-conviction read, not the
+                                               # general 0.4 floor. 0.7 is also
+                                               # where the leverage curve starts
+                                               # scaling past the 5x floor.
+BIGSWING_STOP_RAW = 0.035                     # 3.5% raw stop — backtest sweep
+                                               # beat 2.5% almost everywhere on
+                                               # this signal/universe (2.5% was
+                                               # tighter than these names' normal
+                                               # daily noise, causing whipsaws)
+BIGSWING_TARGET_R = 2.0                       # 2R target (= 7% raw at the stop above)
+BIGSWING_BALANCE_BUFFER = 0.08                # leave 8% of free balance unallocated
+                                               # (fees/funding/slippage headroom)
+BIGSWING_EQUITY_STOP_PCT = 0.20               # hard safety net: force-flatten if
+                                               # account equity drops >=20% from the
+                                               # entry-time snapshot, regardless of
+                                               # whether the resting price stop fired
+BIGSWING_ADOPT_MANUAL = True                  # detect + manage a manually-opened
+                                               # position too (stop/target + the
+                                               # same de-risk/equity-stop rules)
+BIGSWING_ADOPT_SKIP_IF_STOP_EXISTS = True     # don't double-bracket a manual trade
+                                               # that already has a resting stop/tp
+BIGSWING_PAUSE_OTHER_TIERS = True             # scalp/swing/runup auto-execution
+                                               # pauses new entries while bigswing
+                                               # holds a position — one wallet, one
+                                               # full-balance claim at a time
+BIGSWING_MAX_HOLD_HOURS = 7 * 24              # 7 days — longer than the news-tier swing
+BIGSWING_SAMPLE_S = 30                        # entry-scan / adoption-check cadence
+BIGSWING_TREND_DAYS = 10                      # trend-slope lookback (candles.py)
+BIGSWING_TREND_STRONG_PCT = 8.0               # % move over BIGSWING_TREND_DAYS treated
+                                               # as a full-strength trend vote
+BIGSWING_BREAKOUT_DAYS = 20                   # Donchian breakout lookback
+BIGSWING_CANDLE_REFRESH_S = 1800              # 30 min
+
+# News is SECONDARY here (reuses the existing Claude pipeline via
+# combiner.latest_read() — no second news ledger): a fresh, same-direction
+# read nudges conviction up; a fresh, high-confidence OPPOSING read vetoes
+# the entry outright. It never originates a bigswing trade by itself.
+BIGSWING_NEWS_WINDOW_S = 4 * 3600             # how long a news read still counts
+BIGSWING_NEWS_BOOST_MIN_CONF = 0.6            # confidence floor for a confirm boost
+BIGSWING_NEWS_BOOST_AMOUNT = 0.15             # conviction added on confirmation
+BIGSWING_NEWS_VETO_MIN_CONF = 0.75            # confidence floor for a hard veto
+
 # --- Endpoints ---------------------------------------------------------------
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"

@@ -28,6 +28,14 @@ It fuses live news with live order-flow and pings your Telegram when they agree.
   earnings repricing is a genuine edge window for this bot.
 - **Journal:** every alert logged to SQLite with price at +1/+5/+30 min so you can
   measure hit-rate in shadow mode before risking money.
+- **🌊💰 Full-balance swing tier ("bigswing", `BIGSWING_ENABLED`):** a separate,
+  fully-automated strategy — ONE position at a time sized off nearly the
+  whole live account balance, long or short, leverage scaled 5x-10x by a
+  technical/orderbook conviction score (`swing_signals.py`: multi-day trend +
+  Donchian breakout + sustained book imbalance + liquidation pressure), with
+  the existing news pipeline as a secondary confirm/veto only. Disabled by
+  default (`BIGSWING_ENABLED=0`) — see "Full-balance swing tier" below before
+  turning it on.
 
 ## Architecture
 
@@ -53,6 +61,9 @@ Hyperliquid WS ─► tick engine ─────────────► tap
 | `notifier.py` | Telegram alert formatting + send |
 | `journal.py` | SQLite outcome tracking |
 | `main.py` | orchestrator |
+| `candles.py` | live daily OHLC fetch/cache — trend, Donchian breakout, ATR |
+| `swing_signals.py` | bigswing's technical/orderbook conviction scorer |
+| `bigswing.py` | full-balance swing tier: entry engine + manual-position adoption |
 
 ## Setup
 
@@ -78,6 +89,45 @@ SHADOW_MODE=1 .venv/bin/python main.py
 Each module runs standalone: `.venv/bin/python hl_stream.py` (live ticks),
 `tape.py`, `news.py`, `notifier.py` (sends a sample alert), `journal.py`,
 `analyzer.py` (schema check / live once key is set).
+
+## Full-balance swing tier ("bigswing")
+
+A standalone, fully-automated tier — independent of the scalp/swing/runup
+tiers above, which keep sharing `TOTAL_BANKROLL`. **Read
+`backtests/RESULTS.md`'s "All-in single-stock strategy" section before
+enabling this with real money**: that study tested almost this exact idea
+("full-balance, one stock at a time, repeat") and found the aspirational
+return target unsupported, and flagged repeated 10x+ overnight holds as not
+survivable. The guardrails below exist specifically to address that finding
+— don't disable them to "size up".
+
+- **Off by default.** Set `BIGSWING_ENABLED=1` in `.env` and restart the bot
+  to turn it on. With no `HL_AGENT_PRIVATE_KEY`, it runs in the same
+  DRY-RUN mode as everything else (journaled, no real orders) — **run it in
+  dry-run for a stretch and check `journal.summary()` before going live.**
+- **Sizing:** one position at a time, margin = nearly all of
+  `account_monitor.spot_available()` (not the shared `TOTAL_BANKROLL`).
+  While it holds a position, the scalp/swing/runup tiers pause new entries
+  so they don't compete for the same real margin
+  (`BIGSWING_PAUSE_OTHER_TIERS`).
+- **Signal:** primary trigger is technical/orderbook (`swing_signals.py`),
+  not news — the existing Claude pipeline only nudges conviction up on
+  agreement or vetoes an entry on a strongly opposing, high-confidence read
+  (`combiner.latest_read()`).
+- **Leverage:** 5x-10x (`BIGSWING_MIN_LEVERAGE`/`BIGSWING_MAX_LEVERAGE`),
+  scaled by conviction.
+- **Guardrails:**
+  - Overnight de-risk: a stock-perp position not up ≥1R flattens once in the
+    last 15 minutes of NYSE RTH (`market_hours.closing_soon()`) rather than
+    holding through the overnight/weekend gap.
+  - Hard equity safety net: force-closes regardless of the resting price
+    stop if live account equity ever drops `BIGSWING_EQUITY_STOP_PCT` below
+    its entry-time snapshot — a backstop for a gap that jumps past the
+    resting stop.
+  - Manual-position adoption (`BIGSWING_ADOPT_MANUAL`): if you open a
+    position yourself on a watched coin, bigswing detects and manages it
+    too (same de-risk + equity-stop rules; skips adding its own stop/target
+    if you already have a resting one, `BIGSWING_ADOPT_SKIP_IF_STOP_EXISTS`).
 
 ## Risk notes
 

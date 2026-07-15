@@ -17,6 +17,8 @@ import logsetup
 LOG_PATH = logsetup.init()
 
 import account_monitor
+import bigswing
+import candles
 import config
 import earnings
 import earnings_runup
@@ -121,16 +123,30 @@ async def main() -> None:
         else:
             print("[runup] earnings tier DISABLED (RUNUP_ENABLED=0) — "
                   "calendar warnings stay on")
+    if config.BIGSWING_ENABLED:
+        bigswing_coins = [m.coin for m in config.BIGSWING_MARKETS]
+        tasks.append(asyncio.create_task(
+            candles.run(bigswing_coins, config.BIGSWING_CANDLE_REFRESH_S),
+            name="candles"))
+        tasks.append(asyncio.create_task(bigswing.run(stream), name="bigswing"))
+    else:
+        print("[bigswing] full-balance swing tier DISABLED (BIGSWING_ENABLED=0)")
 
     from analyzer import MODEL as ANALYZER_MODEL
     from executor import DRY_RUN
 
     banner = "SHADOW (no alerts sent)" if SHADOW_MODE else "LIVE (alerts on)"
     exec_mode = "DRY-RUN (simulated fills)" if DRY_RUN else "LIVE (real orders)"
+    bigswing_mode = (
+        f"ENABLED ({config.BIGSWING_MIN_LEVERAGE}-{config.BIGSWING_MAX_LEVERAGE}x, "
+        f"full-balance, {'adopts' if config.BIGSWING_ADOPT_MANUAL else 'ignores'} "
+        f"manual entries)" if config.BIGSWING_ENABLED else "disabled"
+    )
     print(f"\n=== Hyperliquid news notifier — {banner} ===")
     print(f"log file: {LOG_PATH}")
     print(f"analyzer model: {ANALYZER_MODEL}")
     print(f"execution: {exec_mode}")
+    print(f"bigswing (full-balance tier): {bigswing_mode}")
     print(f"markets: {coins}")
     print(f"channels: {config.TELEGRAM_CHANNELS}\n")
 

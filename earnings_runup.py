@@ -267,6 +267,12 @@ async def run(stream: HLStream) -> None:
           f"edge-weighted slots, excludes {sorted(config.RUNUP_EXCLUDE)}")
     while True:
         today = date.today()
+        if executor.bigswing_active():
+            # bigswing claims ~the whole account for its single position —
+            # don't also try to place real run-up orders against the same
+            # wallet while it's holding one.
+            await asyncio.sleep(POLL_S)
+            continue
         for coin in earnings._stock_symbols():
             if coin in config.RUNUP_EXCLUDE:
                 continue

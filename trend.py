@@ -17,13 +17,15 @@ import urllib.request
 import config
 
 _TTL_S = 60.0
-_cache: dict[str, float] = {}   # coin -> % change vs prev day close
+_cache: dict[str, float] = {}          # coin -> % change vs prev day close
+_funding_cache: dict[str, float] = {}  # coin -> current hourly funding rate
 _fetched_at = 0.0
 
 
 def _refresh_sync() -> None:
     global _fetched_at
     out: dict[str, float] = {}
+    funding_out: dict[str, float] = {}
     for dex in ("", "xyz"):
         body: dict = {"type": "metaAndAssetCtxs"}
         if dex:
@@ -38,8 +40,13 @@ def _refresh_sync() -> None:
             mark = float(ctx.get("markPx", 0) or 0)
             if prev > 0 and mark > 0:
                 out[asset["name"]] = (mark - prev) / prev * 100
+            fr = ctx.get("funding")
+            if fr is not None:
+                funding_out[asset["name"]] = float(fr)
     _cache.clear()
     _cache.update(out)
+    _funding_cache.clear()
+    _funding_cache.update(funding_out)
     _fetched_at = time.time()
 
 
@@ -53,6 +60,19 @@ def day_change_pct(coin: str) -> float | None:
         except Exception as e:  # noqa: BLE001 — stale beats broken
             print(f"[trend] refresh failed (serving stale): {e!r}")
     return _cache.get(coin)
+
+
+def funding_rate(coin: str) -> float | None:
+    """Current hourly funding rate, or None if unavailable. CONTEXT ONLY —
+    backtests/RESULTS.md's crypto sweep found funding-extreme fade dead on
+    every coin tested; this is surfaced on alerts, never used to pick a
+    direction (see swing_signals.py)."""
+    if time.time() - _fetched_at > _TTL_S:
+        try:
+            _refresh_sync()
+        except Exception as e:  # noqa: BLE001 — stale beats broken
+            print(f"[trend] refresh failed (serving stale): {e!r}")
+    return _funding_cache.get(coin)
 
 
 def fade_block(coin: str, direction: str) -> str | None:

@@ -121,3 +121,93 @@ when our news engine fires on a name AND a skill wallet is positioned the
 same way, boost conviction; when they're positioned against us, warn.
 Do NOT blind-copy: edges are 0.2–0.6%/4h — real but thin; sizing/timing slippage
 can eat them. Validate the watchlist signal in shadow before wiring to money.
+
+## Elite win-rate wallets — history + beta-control deep-dive (2026-07-15 01:10)
+
+Full trading history (not just last 2000 fills) + beta-control on each wallet's dominant market, for the 22 win-rate/PF elites from winrate_scan.py.
+
+| wallet | acct | allTimePnL | dominant | history | since | fills | taker% | events | edge4h | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1` | $820,280 | $3,375,780 | HYPE | 8d | 2025-09-01 | 1998 | 48% | 29 | n/a | no-verdict (thin sample) |
+| `0xc993ef2e69fb55a2beb1c2344469be4fe0fc72b9` | $12,877 | $89,451 | HYPE | 243d | 2025-09-13 | 2000 | 66% | 56 | +0.11% | SKILL (timing beats beta) |
+| `0x984d622f98e0d423eed96a873b1c545eb934f1a1` | $89,923 | $333,016 | BTC | 140d | 2025-06-10 | 2000 | 86% | 55 | n/a | no-verdict (thin sample) |
+| `0xad453be1e0280a1a47c715f4424a9821aebc98f8` | $23,379 | $79,976 | ASTER | 364d | 2025-06-23 | 529 | 44% | 14 | n/a | no-verdict (thin sample) |
+| `0xa4cdf5ada61c413e68acfa80ffaaa23c98d1f940` | $5,877 | $635,789 | ETH | 85d | 2025-06-10 | 1999 | 70% | 33 | n/a | no-verdict (thin sample) |
+| `0x3f8f352217687d755c6d7b879eaed1e9141eb66a` | $50,449 | $517,951 | PENGU | 94d | 2025-06-10 | 1999 | 83% | 43 | n/a | no-verdict (thin sample) |
+| `0x7782d30cf2850815fd84cd99790b4bc6b2c23fd0` | $15,903 | $174,092 | XPL | 27d | 2025-08-27 | 2000 | 49% | 30 | n/a | no-verdict (thin sample) |
+| `0x06e0602c9158ee8478365c74606346d90d06df67` | $13,105 | $96,386 | ETH | 41d | 2025-06-10 | 2000 | 99% | 72 | n/a | no-verdict (thin sample) |
+| `0xf763d7c28ce6a5df1068fdda9627ae19dff65dee` | $136,444 | $1,315,542 | @166 | 358d | 2025-06-12 | 1998 | 55% | 0 | n/a | no-verdict (thin sample) |
+| `0x96b866179f9e7fc566b99b22d5426e9aff893b3e` | $8,052 | $36,393 | YZY | 1d | 2025-10-23 | 2000 | 84% | 36 | n/a | no-verdict (thin sample) |
+| `0x011820f60d75a2b870ffe64a4764873e14bc8ede` | $120,167 | $511,428 | PUMP | 73d | 2025-06-10 | 2000 | 79% | 24 | n/a | no-verdict (thin sample) |
+| `0x9c7df1b20d01aee41d22aac090767739640f60f6` | $5,992 | $18,389 | SOL | 25d | 2025-10-19 | 2000 | 52% | 13 | n/a | no-verdict (thin sample) |
+| `0x987163b6b482c30c2f5f3aa2760109668eb0091d` | $719,176 | $5,153,175 | ETH | 41d | 2025-06-10 | 2000 | 63% | 7 | n/a | no-verdict (thin sample) |
+| `0xff4b619ae22acf9bec42e9e113b8e71e4a109ab2` | $6,159 | $19,458 | BTC | 42d | 2026-02-01 | 1995 | 94% | 50 | n/a | no-verdict (thin sample) |
+| `0x1fbf4789ac39de79936ccc29fa6789db6848a275` | $40,981 | $538,659 | HYPE | 37d | 2025-12-29 | 2000 | 57% | 107 | n/a | no-verdict (thin sample) |
+| `0x36076e4bfad9624d7feba562326fdfa2063ede23` | $102,876 | $333,332 | LIT | 3d | 2026-05-25 | 2000 | 7% | 9 | +2.48% | SKILL (timing beats beta) |
+| `0xc399cb4679a5f59a6a4f00473437d0273dd5d7b4` | $14,270 | $428,284 | @107 | 148d | 2025-06-12 | 1990 | 99% | 0 | n/a | no-verdict (thin sample) |
+| `0x7f1e97d8eb3ddb8659cb59d611becc438f89b7a2` | $58,832 | $243,021 | BTC | 215d | 2025-10-31 | 2000 | 100% | 35 | +0.26% | SKILL (timing beats beta) |
+| `0xf5d13b0477c1ca0722cf1ed8879cc3c26530c5e9` | $9,241 | $70,951 | ETH | 150d | 2025-06-10 | 1995 | 56% | 22 | n/a | no-verdict (thin sample) |
+| `0xd46979f07f5d1e86ae2dcc5e6e0f3af5fe270471` | $64,658 | $225,133 | ZEC | 36d | 2025-09-07 | 2000 | 90% | 10 | n/a | no-verdict (thin sample) |
+| `0x139791013f6dcc26f4052e6a7b8ed50099e7d15b` | $118,979 | $505,289 | BTC | 358d | 2025-06-12 | 1914 | 93% | 4 | n/a | no-verdict (thin sample) |
+
+---
+
+# ROUND 4 — win-rate/profit-factor scan + history/beta cross-check (2026-07-15 01:10)
+
+**New method:** instead of scanning for "informed timing signature" first, reconstruct
+TRUE realized round-trip trades (open-to-flat) from `closedPnl` across a broader
+candidate net (acct $5k-$5M, profitable allTime+month+week, 289 wallets scanned,
+ranked by return-on-account). This is the gold-standard win-rate metric the
+leaderboard's aggregate PnL hides. 122 wallets had >=15 closed trades; 22 were
+"elite" (win% >=60, profit factor >=1.5, consistent both halves).
+
+**Critical filter applied to the elite 22:** most trade HYPE/memecoins/HIP-3 exotics
+(PENGU, YZY, XPL, CASHCAT, LIT, ASTER, unnamed @107/@150/@166 markets) with SHORT
+real history — many wallets' "since" date landed exactly on the 400-day paging
+floor with thin (<40 day) actual track records once verified, or traded too few
+declustered entries to run the beta control. Only wallets with >=6 events AND
+enough candle history to control for beta survived:
+
+- **`0x7f1e97d8eb3ddb8659cb59d611becc438f89b7a2`** — BTC dominant, **215 days**
+  real history, 35 entry-events, 65% win rate, profit factor 12.5, $1,917
+  expectancy/trade. Beta-controlled entryFwd4h +0.26% vs asset baseline = **edge
+  +0.26%/4h → SKILL.** This is an INDEPENDENT confirmation (different scan
+  method entirely) of the BTC dip-timing cluster found in Round 3 — the cluster
+  is now 5 wallets strong.
+- `0xc993ef2e69...` — HYPE dominant, 243 days history, 56 events, edge +0.11%/4h →
+  marginal (barely clears the 0.11% friction floor; not compelling).
+- `0x36076e4bfa...` — LIT, edge +2.48%/4h but only 3 days of real history and 7%
+  taker rate (mostly maker/market-making, not directional timing) → discarded,
+  insufficient track record.
+
+**No insider found in this pass either.** Every high-win-rate wallet with a real
+long track record is either (a) part of the confirmed BTC dip-timing skill cluster,
+or (b) trading illiquid/exotic markets we can't act on, or (c) too short a history
+to trust.
+
+## FINAL CONSOLIDATED WATCHLIST (2026-07-15 01:10)
+
+Cross-referencing all 4 rounds, live positions pulled just now:
+
+| wallet | edge (beats beta) | sample | history | live position right now |
+|---|---|---|---|---|
+| `0x45974824c1c4e4d797aa8d057a5499b46cdefe33` | **+0.43%/4h** (best) | n=21, xyz:SKHY | — | SHORT xyz:SPCX (+$26.5k uPnL), SHORT xyz:LLY (+$5.9k), LONG xyz:SKHY (+$3.0k), + smaller BTC/HYPE/XYZ100/JPY/IBM/CXMT |
+| `0xdd0c5de50d72e5eaa96816e920e41ce89c4b8888` | +0.63%/4h (thin, n=7) | xyz:META | — | LONG xyz:META 340.7 @ $661.5 (-$139 uPnL) — **one of our own markets** |
+| `0xbafae6afa1f7b0001860f627354130c859031b76` | +0.29%/4h | n=23, BTC | — | flat |
+| `0xbbbdbbfa1f754aea323af6cc56153e0605e89227` | +0.28%/4h (best sample) | n=56, BTC | — | LONG BTC, LONG HYPE, SHORT xyz:SNDK (-$7.9k), LONG xyz:SKHX, LONG xyz:CXMT |
+| `0x7f1e97d8eb3ddb8659cb59d611becc438f89b7a2` | +0.26%/4h | n=35, BTC, wr65%/pf12.5 | **215d** | LONG xyz:AMZN 200 @ $244.7 (+$690) — **one of our own markets** |
+| `0xbe3f79ae0ab3294aaa3230c1155e912c05b6a55b` | +0.21%/4h | n=13, BTC | — | flat |
+| `0xd67ca2c6f8bc84acf4fa4472b82a8740dc0a53ff` | +0.15%/4h | n=11, BTC | — | LONG BTC 80 @ $64,039 (+$46.5k uPnL) |
+| `0x9e8b1e51c642f4c8b87c6ba11c53d516a218afc4` (whale, untested for timing) | n/a — too few events/day to test | $24.5M all-time | — | SHORT ~$11M xyz:SPCX (+$1.67M uPnL) |
+
+**Notable cross-confirmation:** `0x45974824` (confirmed SKILL wallet, +0.43%/4h edge)
+and the untested $11M whale are **both short xyz:SPCX right now** — two
+independent large accounts on the same side, one with a proven timing edge. This
+is the single most actionable signal in the whole investigation.
+
+**Bottom line:** no insider signature exists anywhere in ~500+ wallets scanned
+across 4 rounds. What exists is a reproducible, cross-validated BTC dip-timing
+skill cluster (5 wallets, 2 independent test methods) plus 2 stock-specific
+skill wallets (SKHY, META) — real but thin edges (0.15–0.63%/4h before our own
+slippage). Track the 8-wallet watchlist's live positions as a confirmation
+signal; do not blind-copy.
