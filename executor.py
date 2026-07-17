@@ -165,34 +165,68 @@ def coin_direction_conflict(coin: str, direction: str) -> str | None:
 
 
 def bigswing_active() -> bool:
-    """True if the full-balance bigswing tier currently holds an open
-    position. Checked directly against the journal (not bigswing.py's
-    in-memory state) to avoid a circular import — bigswing.py imports this
-    module, so this module must not import bigswing.py back."""
-    if not config.BIGSWING_PAUSE_OTHER_TIERS:
-        return False
-    with journal._conn() as c:  # noqa: SLF001
-        row = c.execute(
-            "SELECT 1 FROM signals WHERE horizon='bigswing' AND executed=1 "
-            "AND (exit_reason IS NULL OR exit_reason='') LIMIT 1").fetchone()
-    return row is not None
+    """True if scalp/swing/runup should stay paused because of bigswing.
+
+    FULLY exclusive by design (changed 2026-07-15: a "holds a position"-only
+    gate left a race at boot/right after a bigswing exit where bigswing had
+    zero position for a few seconds and swing slipped two trades in before
+    bigswing's own next scan landed — "one stock, one position, period" means
+    the account is bigswing's ANY time the tier is enabled, not just while it
+    happens to already have a fill). So this is now just a config check, not
+    a journal lookup — kept as a function (not inlined at call sites) so
+    executor.py/earnings_runup.py don't need to know *why*, just that other
+    tiers must not place real orders right now.
+
+    Lifted when BIGSWING_PAUSE_ENTRIES is set: a paused bigswing opens nothing
+    new, so the other tiers can safely reclaim the wallet (they're still
+    margin-blocked while the paused tier's last position is open, then take
+    over once it closes)."""
+    return (config.BIGSWING_ENABLED and config.BIGSWING_PAUSE_OTHER_TIERS
+            and not config.BIGSWING_PAUSE_ENTRIES)
 
 
-def guardrail_block(tier: str = "scalp") -> str | None:
+def correlation_block(coin: str, direction: str) -> str | None:
+    """Factor-exposure cap: GOOGL short + SPCX short + AMD short is ONE
+    short-tech-beta bet occupying three slots (audit 2026-07-17) — a Nasdaq
+    bounce hits all of them at once. Counts LIVE exchange positions in the
+    correlated cluster on the same side (any tier, manual included: factor
+    exposure doesn't care who opened it). Only consulted on the news-tier
+    entry path — run-up's long-into-earnings basket is the validated
+    strategy shape and is never blocked by this."""
+    if coin not in config.CORRELATED_TECH or not account_monitor.has_polled():
+        return None
+    same_dir = [c for c, p in account_monitor.LIVE.items()
+                if c != coin and c in config.CORRELATED_TECH
+                and p.side == direction]
+    if len(same_dir) >= config.MAX_CORRELATED_SAME_DIR:
+        return (f"🧲 correlated-beta cap: already {direction} "
+                f"{'/'.join(same_dir)} — a {direction} {coin} on top is the "
+                f"same tech-beta bet at {len(same_dir) + 1}x the factor risk, "
+                f"not a new idea (max {config.MAX_CORRELATED_SAME_DIR}).")
+    return None
+
+
+def guardrail_block(tier: str = "scalp", confidence: float | None = None) -> str | None:
     """Return a human reason if trading is currently blocked, else None.
-    Kill switch and real-margin check are global; concurrency and budget are
-    per tier."""
+    Kill switch, real-margin and the GLOBAL bankroll cap are account-wide;
+    concurrency and budget are per tier. `confidence` (when the caller has
+    one) gates the LAST swing slot: reserved for conviction >=0.80 so a
+    mediocre morning signal can't fill the book before a great one arrives
+    (slots, not signals, are the scarce resource — audit 2026-07-17)."""
     if losses_today() >= config.DAILY_LOSS_LIMIT:
         return (f"🛑 KILL SWITCH: {config.DAILY_LOSS_LIMIT} stopped-out trades "
                 f"today. Halted until midnight ET.")
-    # bigswing claims ~the whole account for its single open position — the
-    # scalp/swing/runup tiers must not also place real orders against the
-    # same wallet while it's holding one, or they'd be fighting over margin
-    # bigswing already committed.
-    if tier != "bigswing" and bigswing_active():
-        return ("⛔ bigswing holds an open full-balance position — other "
-                "tiers stay paused so they don't compete for the same real "
-                "margin.")
+    # bigswing claims ~the whole account, exclusively, whenever it's enabled —
+    # the scalp/swing/runup tiers must not place real orders against the same
+    # wallet at all while it's on, not just while it happens to hold a fill
+    # (see bigswing_active()'s docstring for why "holds a position" alone
+    # left a startup race). Rally is deliberately ALLOWED alongside
+    # (requested): its own fractional slot + arm→confirm gate; same-coin
+    # stacking is still blocked by coin_direction_conflict.
+    if tier not in ("bigswing", "rally") and bigswing_active():
+        return ("⛔ bigswing tier is active (full-balance, exclusive) — other "
+                "tiers stay fully paused so they never compete for the same "
+                "real margin.")
     # The bot's own tier-budget math can say "plenty of room" while the real
     # exchange account has nothing free (e.g. a manual trade parked margin
     # the bot's own tracking never sees) — check REAL spot balance before
@@ -207,26 +241,60 @@ def guardrail_block(tier: str = "scalp") -> str | None:
                     f"(below the ${config.MIN_MARGIN_PER_TRADE:.0f} minimum) — "
                     f"account fully deployed, not attempting a trade.")
     cap = config.TIER_MAX_CONCURRENT.get(tier, 2)
-    if open_positions(tier) >= cap:
+    if cap <= 0:
+        return (f"⛔ {tier} tier is disabled (0 slots — realized-negative in "
+                f"the 2026-07-17 audit); signal noted but no capital.")
+    n_open = open_positions(tier)
+    if n_open >= cap:
         return (f"⛔ {cap} {tier} positions already open — "
                 f"close one before adding risk.")
+    # Last-slot reservation: the final swing slot only opens for conviction
+    # >=0.80. On 07-17 a conf-0.65 signal at 05:57 filled the book and
+    # conf-0.70+ NVDA/MRVL shorts at 08:22 were refused — backwards.
+    if (tier == "swing" and confidence is not None and n_open >= cap - 1
+            and confidence < 0.80):
+        return (f"🎟️ last swing slot is reserved for conviction >=0.80 "
+                f"(this signal: {confidence:.2f}) — keeping one bullet for "
+                f"a great setup, not a good one.")
     share = bankroll() * config.TIER_BUDGET_FRAC.get(tier, 0.2)
     committed = margin_committed(tier)
     if share - committed < config.MIN_MARGIN_PER_TRADE:
         return (f"💸 {tier} budget spent: ${committed:.2f} of ${share:.2f} "
                 f"share — wait for a {tier} position to close.")
+    # GLOBAL cap: tier fractions deliberately oversubscribe (sum >1.0) so
+    # capital never idles, but the BOOK can never exceed the bankroll — the
+    # per-tier share alone stopped guaranteeing that once swing went to 75%.
+    total = margin_committed()
+    if bankroll() - total < config.MIN_MARGIN_PER_TRADE:
+        return (f"🏦 global cap: ${total:.2f} of ${bankroll():.2f} bankroll "
+                f"already committed across all tiers — no headroom for "
+                f"another position anywhere.")
     return None
 
 
 # --- sizing --------------------------------------------------------------------
-def allocate_margin(confidence: float, tier: str = "scalp") -> float:
+def allocate_margin(confidence: float, tier: str = "scalp",
+                    stop_frac: float | None = None) -> float:
     """Slot from the tier's bankroll share: base = share / tier cap, scaled
-    0.8x–1.2x by analyzer confidence, capped by what the tier hasn't already
-    committed. Tiers that make money grow their own share (bankroll compounds)."""
+    0.8x–1.2x by analyzer confidence, capped by BOTH what the tier hasn't
+    already committed AND the global bankroll headroom (tier fractions
+    oversubscribe on purpose; the sum of live margin must not).
+
+    stop_frac (raw stop distance as a fraction of entry) makes sizing
+    RISK-CONSTANT: with ATR stops a wide-stop name (volatile) takes less
+    margin and a tight-stop name more, so every trade in the tier risks
+    ~the same $ (margin x lev x stop is what you actually lose at the stop,
+    and lev is fixed per tier). Clamped 0.5x-1.5x so a data glitch can't
+    zero or double a position."""
     share = bankroll() * config.TIER_BUDGET_FRAC.get(tier, 0.2)
-    base = share / config.TIER_MAX_CONCURRENT.get(tier, 2)
+    cap = max(1, config.TIER_MAX_CONCURRENT.get(tier, 2))
+    base = share / cap
     mult = min(1.2, max(0.8, 0.8 + 0.8 * (confidence - 0.5)))
-    available = share - margin_committed(tier)
+    if stop_frac and stop_frac > 0 and tier == "swing":
+        risk_adj = config.SWING_STOP_RAW / stop_frac
+        mult *= min(1.5, max(0.5, risk_adj))
+    available = min(share - margin_committed(tier),
+                    bankroll() - margin_committed())
     return round(max(0.0, min(base * mult, available)), 2)
 async def _load_sz_decimals() -> None:
     if _sz_decimals:
@@ -267,11 +335,13 @@ async def execute(pid: str) -> str:
     if pt.expired:
         discard(pid)
         return "⌛ Expired — market has moved on since this alert (15 min TTL)."
-    block = guardrail_block(pt.horizon)
+    block = guardrail_block(pt.horizon, pt.confidence)
     if block:
         return block
 
-    margin = allocate_margin(pt.confidence, pt.horizon)
+    stop_frac = (abs(pt.entry_ref - pt.stop) / pt.entry_ref
+                 if pt.entry_ref > 0 else None)
+    margin = allocate_margin(pt.confidence, pt.horizon, stop_frac)
     if margin < config.MIN_MARGIN_PER_TRADE:
         return (f"💸 Only ${margin:.2f} of the ${bankroll():.2f} bankroll "
                 f"left — below the ${config.MIN_MARGIN_PER_TRADE:.0f} minimum. Skipping.")
@@ -295,9 +365,11 @@ async def execute(pid: str) -> str:
                 f"Add HL_AGENT_PRIVATE_KEY to go live.")
 
     try:
-        result = await asyncio.to_thread(_place_bracket_sync, pt, sz, margin)
+        result, fill_px = await asyncio.to_thread(_place_bracket_sync, pt, sz, margin)
         discard(pid)
         journal.mark_executed(pt.signal_id, dry_run=False, margin=margin)
+        if fill_px:
+            journal.record_fill(pt.signal_id, fill_px)
         return result
     except Exception as e:  # noqa: BLE001
         return f"❌ Order failed: {e!r}"
@@ -320,14 +392,32 @@ def _exchange():
                     perp_dexs=["", "xyz"])
 
 
-def _place_bracket_sync(pt: PendingTrade, sz: float, margin: float) -> str:
+def _avg_fill_px(order_resp: dict) -> float | None:
+    """Real average fill price off an order response's `filled` status, if
+    present (a resting/triggered order has no `filled` block yet — None in
+    that case, caller falls back to the entry_ref reference price)."""
+    try:
+        for status in order_resp["response"]["data"]["statuses"]:
+            if "filled" in status:
+                return float(status["filled"]["avgPx"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _place_bracket_sync(pt: PendingTrade, sz: float, margin: float) -> tuple[str, float | None]:
     """Blocking SDK calls: market entry + reduce-only stop & target triggers.
     coin_direction_conflict() already blocks entries on a coin that's already
     held, so update_leverage should normally succeed (nothing open yet) — a
     failure here means something opened in the race window between that check
     and this order. watcher's live reconciliation (every ~10s) will correct
     the stop/target off the position's REAL leverage regardless, so this is
-    just logged for visibility rather than silently swallowed."""
+    just logged for visibility rather than silently swallowed.
+
+    Returns (status message, real average fill price or None) — the fill
+    price is distinct from pt.entry_ref (the mid-price the stop/target math
+    was computed off at decision time); the gap is real slippage, useful for
+    a backtest built from live trades rather than a proxy."""
     ex = _exchange()
     is_buy = pt.direction == "long"
     try:  # isolated margin caps the worst case at the allotted margin
@@ -340,6 +430,7 @@ def _place_bracket_sync(pt: PendingTrade, sz: float, margin: float) -> str:
     entry = ex.market_open(pt.coin, is_buy, sz)
     if entry.get("status") != "ok":
         raise RuntimeError(f"entry rejected: {entry}")
+    fill_px = _avg_fill_px(entry)
 
     # Server-side exits (reduce-only triggers), opposite side of the entry.
     stop_px = round_px(pt.coin, pt.stop)
@@ -356,8 +447,9 @@ def _place_bracket_sync(pt: PendingTrade, sz: float, margin: float) -> str:
     if tp_o.get("status") != "ok":
         notes.append(f"⚠️ target order rejected: {tp_o}")
     tail = ("\n" + "\n".join(notes)) if notes else "\n✅ stop + target resting on exchange."
+    fill_note = f" (filled @ {fill_px:g})" if fill_px else ""
     return (f"✅ FILLED: {pt.direction.upper()} {sz} {pt.coin} "
-            f"(${margin:.2f} margin @ {pt.leverage}x){tail}")
+            f"(${margin:.2f} margin @ {pt.leverage}x){fill_note}{tail}", fill_px)
 
 
 def place_runup_entry_sync(coin: str, sz: float, leverage: int, stop: float) -> str:
@@ -393,14 +485,24 @@ def guardrail_block_bigswing() -> str | None:
 
 async def execute_bigswing(*, coin: str, label: str, direction: str,
                            entry_ref: float, stop: float, target: float,
-                           leverage: int, margin: float) -> tuple[str, int | None]:
+                           leverage: int, margin: float, conviction: float = 0.0,
+                           trend_pct: float | None = None, breakout: str = "none",
+                           imbalance: float | None = None, liq_note: str = "",
+                           funding_note: str = "", news_note: str = "",
+                           equity_baseline: float | None = None) -> tuple[str, int | None]:
     """Full-balance entry for the bigswing tier: same bracket mechanics as
     execute(), but `margin` is passed in directly (bigswing derives it from
     account_monitor.spot_available(), NOT allocate_margin's tier-fraction
     slot) since bigswing claims ~the whole account for its single open
     position. Returns (status message, signal_id) — signal_id is None if
     nothing was actually opened (blocked, zero size, or the order failed),
-    so the caller knows not to treat the bigswing slot as occupied."""
+    so the caller knows not to treat the bigswing slot as occupied.
+
+    conviction/trend_pct/breakout/imbalance/liq_note/funding_note/news_note/
+    equity_baseline are the full decision-input breakdown from swing_signals
+    + the news confirm/veto check — logged to the journal (not just sent to
+    Telegram) so a real trade's inputs are queryable later for a backtest
+    built off live data rather than a proxy."""
     block = guardrail_block_bigswing()
     if block:
         return block, None
@@ -415,13 +517,21 @@ async def execute_bigswing(*, coin: str, label: str, direction: str,
         entry_ref=entry_ref, stop=stop, target=target, leverage=leverage,
         horizon="bigswing", confidence=1.0, created=time.time(),
     )
+    # confidence = the REAL conviction the trade was sized on (was hardcoded
+    # 1.0, which poisoned any confidence-vs-outcome calibration query);
+    # magnitude 0.0 = "n/a, technical entry" rather than a fake perfect score.
+    log_kwargs = dict(
+        coin=coin, direction=direction, confidence=conviction, magnitude=0.0,
+        leverage=leverage, entry=entry_ref, headline="bigswing technical entry",
+        rationale="full-balance swing entry", tape_note="", horizon="bigswing",
+        stop=stop, target=target, conviction=conviction, trend_pct=trend_pct,
+        breakout=breakout, imbalance=imbalance, liq_note=liq_note,
+        funding_note=funding_note, news_note=news_note,
+        equity_baseline=equity_baseline,
+    )
 
     if DRY_RUN:
-        sid = journal.log_signal(
-            coin=coin, direction=direction, confidence=1.0, magnitude=1.0,
-            leverage=leverage, entry=entry_ref, headline="bigswing technical entry",
-            rationale="full-balance swing entry", tape_note="", horizon="bigswing",
-            stop=stop)
+        sid = journal.log_signal(**log_kwargs)
         journal.mark_executed(sid, dry_run=True, margin=margin)
         return (f"🧪 DRY RUN — would place: {direction.upper()} {sz} {coin} "
                 f"(~${notional:,.0f} notional, ${margin:.2f} margin @ {leverage}x)\n"
@@ -429,16 +539,14 @@ async def execute_bigswing(*, coin: str, label: str, direction: str,
                 f"server-side)"), sid
 
     try:
-        result = await asyncio.to_thread(_place_bracket_sync, pt, sz, margin)
+        result, fill_px = await asyncio.to_thread(_place_bracket_sync, pt, sz, margin)
     except Exception as e:  # noqa: BLE001 — no order placed, nothing to journal
         return f"❌ Order failed: {e!r}", None
 
-    sid = journal.log_signal(
-        coin=coin, direction=direction, confidence=1.0, magnitude=1.0,
-        leverage=leverage, entry=entry_ref, headline="bigswing technical entry",
-        rationale="full-balance swing entry", tape_note="", horizon="bigswing",
-        stop=stop)
+    sid = journal.log_signal(**log_kwargs)
     journal.mark_executed(sid, dry_run=False, margin=margin)
+    if fill_px:
+        journal.record_fill(sid, fill_px)
     return result, sid
 
 
@@ -478,6 +586,32 @@ def has_resting_stop(coin: str) -> bool:
     except Exception as e:  # noqa: BLE001 — assume none rather than block adoption
         print(f"[executor] has_resting_stop check failed for {coin}: {e!r}")
         return False
+
+
+def partial_close_sync(coin: str, frac: float) -> str:
+    """Market-close `frac` of the LIVE position (reduce-only by construction:
+    market_close with an explicit sz). Resting stop/target triggers are left
+    in place — they're reduce-only, so after the partial they simply cap to
+    whatever remains; the watcher's in-memory breakeven/trail is the operative
+    exit for the runner, the resting orders stay as the disaster backstop."""
+    pos = account_monitor.get(coin)
+    if pos is None:
+        return "no live position to partial-close"
+    sz = abs(pos.size) * frac
+    dec = _sz_decimals.get(coin, 2)
+    sz = round(sz, dec) if dec > 0 else float(int(sz))
+    if sz <= 0:
+        return "partial size rounds to 0 — skipped"
+    ex = _exchange()
+    try:
+        res = ex.market_close(coin, sz=sz)
+        if res is None:
+            return "no position on exchange (already closed?)"
+        if res.get("status") != "ok":
+            return f"partial close rejected: {res}"
+        return f"banked {sz:g} {coin} ({frac * 100:.0f}%) ✅"
+    except Exception as e:  # noqa: BLE001
+        return f"partial close failed: {e!r}"
 
 
 def close_position_sync(coin: str) -> str:

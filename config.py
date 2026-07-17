@@ -23,6 +23,8 @@ def _opt(name: str, default: str = "") -> str:
 
 # --- Secrets -----------------------------------------------------------------
 PERPLEXITY_API_KEY = _opt("PERPLEXITY_API_KEY")
+ALPACA_API_KEY = _opt("ALPACA_API_KEY")       # real-time Benzinga news (free,
+ALPACA_API_SECRET = _opt("ALPACA_API_SECRET")  # paper keys work — read-only feed)
 TELEGRAM_API_ID = _opt("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = _opt("TELEGRAM_API_HASH")
 TELEGRAM_BOT_TOKEN = _opt("TELEGRAM_BOT_TOKEN")
@@ -90,6 +92,27 @@ MARKETS: list[Market] = [
     Market("xyz:HOOD", "Robinhood", 10,
            ("robinhood", "hood", "vlad tenev", "retail brokerage",
             "retail trading", "commission-free")),
+    # --- expanded universe (2026-07-16): most-liquid xyz builder-perps not
+    # already watched, so the news engine can trade the ACTUAL name a headline
+    # is about instead of a proxy (e.g. SK Hynix news mapped to MU before).
+    # Vetted by 24h volume in the metaAndAssetCtxs survey; all excluded from
+    # run-up (never backtested — see RUNUP_EXCLUDE). ---
+    Market("xyz:SKHX", "SK Hynix", 10,
+           ("sk hynix", "hynix", "skhynix", "hbm memory")),
+    Market("xyz:SNDK", "SanDisk", 10,
+           ("sandisk", "sndk", "nand flash", "flash storage")),
+    Market("xyz:SMSN", "Samsung", 10,
+           ("samsung", "smsn", "galaxy phone", "samsung electronics")),
+    Market("xyz:SPCX", "SpaceX", 20,
+           ("spacex", "spcx", "starship", "starlink", "raptor engine")),
+    Market("xyz:CRCL", "Circle", 10,
+           ("circle internet", "crcl", "usdc issuer", "stablecoin issuer")),
+    Market("xyz:MRVL", "Marvell", 10,
+           ("marvell", "mrvl", "marvell technology")),
+    Market("xyz:NBIS", "Nebius", 10,
+           ("nebius", "nbis", "ai cloud")),
+    Market("xyz:ORCL", "Oracle", 10,
+           ("oracle", "orcl", "larry ellison", "oracle cloud")),
     Market("xyz:XYZ100", "Nasdaq-100 (XYZ100)", 30,
            ("nasdaq", "ndx", "xyz100", "tech stocks", "qqq", "cpi", "fed",
             "rate", "inflation", "jobs report", "fomc")),
@@ -115,6 +138,60 @@ SWING_LEVERAGE = 5      # swing tier: multi-day holds need liq 20%+ away
 # at its own entry time; see notifier.resolve_stop().
 SCALP_STOP_RAW = 0.005
 SWING_STOP_RAW = 0.03
+# --- Volatility-aware stops (2026-07-17 audit) --------------------------------
+# A fixed 3% stop treats AAPL (quiet) and SKHX (6% intraday on the Kospi rout)
+# identically: SKHX gets noise-stopped, AAPL's stop is needlessly generous.
+# Swing stops scale with the name's OWN daily ATR instead, clamped so a quiet
+# tape can't produce a hair-trigger stop nor a wild one an unsurvivable stop.
+# Sizing compensates inversely (executor: risk-constant margin) so every swing
+# trade risks about the same $ regardless of which name it's in. Falls back
+# to SWING_STOP_RAW when candle history is missing. New trades only — an open
+# position's stop stays frozen at its entry-time value (see resolve_stop).
+ATR_STOPS = _opt("ATR_STOPS", "1") == "1"
+ATR_STOP_MULT = 1.5             # stop distance = 1.5 x 14d ATR%
+ATR_STOP_MIN = 0.015            # never tighter than 1.5% raw
+ATR_STOP_MAX = 0.05             # never wider than 5% raw
+# --- Correlated-beta cap (2026-07-17 audit) -----------------------------------
+# GOOGL short + SPCX short + AMD short is ONE short-tech-beta bet occupying
+# three slots at 3x the intended factor risk — a Nasdaq bounce hits all of
+# them at once. Cap same-direction positions across the correlated tech
+# cluster (counted from LIVE exchange positions, any tier, manual included —
+# factor exposure is factor exposure regardless of who opened it). Run-up is
+# exempt: its long-into-earnings basket IS the validated strategy shape.
+CORRELATED_TECH = {m.coin for m in MARKETS
+                   if m.coin not in ("BTC",)}   # every equity/index perp
+MAX_CORRELATED_SAME_DIR = 2
+# --- Partial exits (2026-07-17 audit) -----------------------------------------
+# 45 trades, ZERO hit the 2R target; all real winners exited via FADE at ~1R.
+# Realized geometry was therefore symmetric (risk 1R to win 1R) at a 39% win
+# rate — negative expectancy. Asymmetry fix: at +1R bank half, move the stop
+# on the rest to breakeven (trade can no longer lose), and trail the runner
+# 1R behind its best price toward a 3R target. Applies to watcher-managed
+# tiers (swing/bigswing/rally); run-up keeps its validated exit shape.
+PARTIAL_EXIT = _opt("PARTIAL_EXIT", "1") == "1"
+PARTIAL_EXIT_FRAC = 0.5         # fraction closed at the 1R bank
+PARTIAL_MIN_NOTIONAL = 22.0     # skip the partial if halving would leave less
+                                # than the exchange's $10 order min per piece
+PARTIAL_RUNNER_TARGET_R = 3.0   # runner rides toward 3R (was fixed 2R for all)
+# --- Funding-aware entries (2026-07-17 research) ------------------------------
+# Measured live: SKHX shorts pay ~1.1%/DAY funding (crowd-shorted Korea/memory
+# complex, -417%/yr) — a multi-day swing there bleeds more in carry than its
+# expected edge. If holding the direction costs > FUNDING_COSTLY_DAILY, demand
+# extra conviction; > FUNDING_BLOCK_DAILY, refuse outright. Missing data never
+# gates (funding.daily_cost returns None -> no adjustment).
+FUNDING_COSTLY_DAILY = 0.003    # >0.3%/day against us: need +0.05 conviction
+FUNDING_BLOCK_DAILY = 0.008     # >0.8%/day against us: block the swing entry
+# --- Korea->US semi lead-lag (validated 2026-07-17, shadow-first) -------------
+# 60d hourly backtest: Korea-session (00-07 UTC) move of SKHX+SMSN >=1% predicts
+# same-direction US-RTH basket return on MU/NVDA/AMD/SNDK: +0.85%/day mean
+# (+1.13% median, 66% win, n=35, both halves positive, works long AND short,
+# net of measured 2bp fees, robust to 14:00 UTC entry). Runs in SHADOW mode
+# (signal + telegram + jsonl, no orders) until forward-validated live.
+KOREA_ENABLED = _opt("KOREA_ENABLED", "1") == "1"
+KOREA_LIVE = _opt("KOREA_LIVE", "0") == "1"        # flip after shadow proof
+KOREA_MIN_SIGNAL = 0.01         # |Korea session move| to arm
+KOREA_SIGNAL_COINS = ["xyz:SKHX", "xyz:SMSN"]
+KOREA_TRADE_COINS = ["xyz:MU", "xyz:NVDA", "xyz:AMD", "xyz:SNDK"]
 
 # --- News-tier entry quality gates (2026-07-14, from live-trade review) --------
 # Floors raised from scalp 0.5/0.3 + swing 0.6/0.4: every fired trade was
@@ -125,8 +202,9 @@ SWING_STOP_RAW = 0.03
 # best few — capacity is the scarce resource, not ideas.
 SCALP_MIN_CONF = 0.65
 SCALP_MIN_MAG = 0.40
-SWING_MIN_CONF = 0.65
-SWING_MIN_MAG = 0.40
+SWING_MIN_CONF = 0.70   # 0.65->0.70 (2026-07-17 audit): 47% of headlines were
+SWING_MIN_MAG = 0.50    # scoring actionable — slots are the scarce resource,
+                        # spend them on stronger reads (0.40->0.50 mag too)
 
 # Never fade a strong same-day move: the 30s tape window is blind to daily
 # trend (it read "flat" while MU was +6.7% on the day and let a short through
@@ -137,6 +215,14 @@ TREND_FILTER_PCT = 3.0
 # catalysts; 20x round-trip fees eat the scratches). Scalp tier is single
 # names only; swing on indexes stays allowed (macro theses are real).
 SCALP_EXCLUDE = {"xyz:XYZ100", "xyz:SP500"}
+
+# 24/7, NON-US-listed perps: SpaceX is private, SK Hynix + Samsung are Korean.
+# They do NOT halt at the 16:00 ET US close and trade through "overnight" (SPCX
+# crashed -10% at 18:00 ET on 2026-07-16). So the US-market-hours rules —
+# RTH-only scalps, and the bigswing offhours-derisk that flattens before an
+# overnight gap — are WRONG for them (they cost the SPCX short a correct win).
+# These names are exempt from both; managed on price/tape/smart-money instead.
+CONTINUOUS_MARKETS = {"xyz:SPCX", "xyz:SKHX", "xyz:SMSN"}
 
 # Scalps must play out in liquid hours: the losing MU short opened 05:20 ET
 # into a thin pre-market book and drifted to the 4h clock. Stock/index scalps
@@ -151,8 +237,15 @@ RUNUP_ENABLED = _opt("RUNUP_ENABLED", "0") == "1"
 RUNUP_LEVERAGE = 5
 RUNUP_ENTRY_TDAYS = 10          # trading days before the print to enter
 RUNUP_STOP_RAW = 0.03           # -3% raw = -15% on margin hard stop
-RUNUP_MAX_CONCURRENT = 2        # own cap (was 4; shrunk for the $17.5 bankroll)
-RUNUP_EXCLUDE = {"xyz:TSLA",    # negative run-up expectancy in backtest
+RUNUP_MAX_CONCURRENT = 4        # 2026-07-16: raised 2->4 to deploy idle capital
+                                # into peak earnings season (INTC 7/23, MSFT/META
+                                # 7/29, AAPL/AMZN 7/30, AMD 8/4) — more of the
+                                # ONE validated edge, each slot independently
+                                # sized+stopped (vs bigswing's all-in-on-one)
+RUNUP_EXCLUDE = {"xyz:TSLA",                 # negative run-up expectancy in backtest
+                 # 2026-07-16 expansion — never in the run-up backtest, news-only
+                 "xyz:SKHX", "xyz:SNDK", "xyz:SMSN", "xyz:SPCX",
+                 "xyz:CRCL", "xyz:MRVL", "xyz:NBIS", "xyz:ORCL",
                  "xyz:HOOD"}    # never backtested for run-up (added to MARKETS
                                 # 2026-07-14 only for news monitoring of the
                                 # user's manual position) — validate before funding
@@ -166,30 +259,60 @@ RUNUP_NEWS_EXIT = _opt("RUNUP_NEWS_EXIT", "0") == "1"
 RUNUP_NEWS_MIN_CONF = 0.80      # analyzer confidence floor for a veto
 RUNUP_NEWS_MIN_MAG = 0.60       # analyzer magnitude floor (size of the move)
 
-# Same news-veto exit, generalized to scalp/swing: a held position with no
-# tape-driven exit for LOSING trades (FADE only protects winners; STOP is a
-# big price move away) otherwise has nothing but the clock to save it from a
-# thesis that's gone bad. Same conservative bars as the run-up veto — this is
-# still an early-exit override, not a new trading signal, so it stays strict.
+# Bad news on a HELD position — THREE-TIER, asymmetric response (2026-07-15).
+# The old single bar (0.80/0.60) was HIGHER than the 0.65/0.40 ENTRY bar — i.e.
+# it was harder for the bot to get OUT of a position than it was to get IN, so
+# ordinary bad news just warned while the bot sat in the trade. That's backwards:
+# protecting capital you already hold should be EASIER than risking new capital.
+#   - EXIT   (>= these bars): full early close, any PnL. Lowered 0.80->0.70.
+#   - PROTECT(>= these, below EXIT AND below entry): if in profit, ratchet the
+#     stop to breakeven and stay in (non-destructive — can't turn into a loss
+#     from here); if underwater, warn only (price stop / EXIT bar handle it).
+#   - below PROTECT: warn only (a heads-up, never a "short now" instruction).
 NEWS_EXIT_SCALP_SWING = _opt("NEWS_EXIT_SCALP_SWING", "0") == "1"
-NEWS_EXIT_MIN_CONF = 0.80
-NEWS_EXIT_MIN_MAG = 0.60
+NEWS_EXIT_MIN_CONF = 0.70
+NEWS_EXIT_MIN_MAG = 0.50
+NEWS_PROTECT_MIN_CONF = 0.55
+NEWS_PROTECT_MIN_MAG = 0.35
 
 # --- Data-driven bankroll allocation (across ALL methods) ----------------------
-# Weighted by evidence (backtests/RESULTS.md):
-#   runup 50% — the only validated edge: +10.6% EV on margin/event at 5x,
-#               62% win over 389 events, ~1% ruin risk
-#   swing 30% — unproven but structurally favored: 0.55% friction per trade,
-#               multi-day horizon matches how news actually gets priced in
-#   scalp 20% — unproven AND costly: 1.8% of margin per round trip at 20x,
-#               geometry study showed current targets nearly unreachable.
-# Shares recompute off the LIVE bankroll, so tiers that win grow their own
-# budgets and tiers that lose shrink — allocation self-adjusts with results.
-TIER_BUDGET_FRAC = {"runup": 0.50, "swing": 0.30, "scalp": 0.20}
-# swing gets a 2nd slot at the $40 bankroll ($12 share -> $6 slots, $30
-# notional at 5x, comfortably over the exchange's $10 minimum); scalp stays
-# at 1 — weakest tier, hasn't earned more concurrency yet
-TIER_MAX_CONCURRENT = {"runup": 2, "swing": 2, "scalp": 1}
+# RUN-UP IS THE BACKBONE (2026-07-15): it is the ONLY edge validated end-to-end
+# (+1.59%/event net, 62% win, n=389 over 10y), and the catalyst-continuation
+# study (RESULTS.md) confirmed swing-alone is roughly break-even — a real but
+# thin edge, not a growth engine. So the account grows on run-up; swing/rally
+# are opportunistic fillers BETWEEN earnings windows, and scalp (weakest AND
+# costliest — geometry study showed its targets near-unreachable) is trimmed
+# to a token allocation. Shares recompute off the LIVE bankroll, so winners
+# grow their own budgets and losers shrink — allocation self-adjusts.
+#   runup 50% / swing 75% — user set runup=swing equal at 50/50 (2026-07-17),
+#               then raised swing's concurrency to 3 slots and asked for the
+#               budget to scale with it, so swing's share went 50->75% to
+#               hold ~$10/slot at 3 concurrent instead of shrinking to
+#               ~$6.67/slot. NOTE: this now gives swing MORE total budget
+#               than run-up, even though run-up is still the only
+#               end-to-end-validated edge (+1.59%/event) and swing backtests
+#               roughly break-even — revisit if swing drags on PnL.
+#   rally  5% — news + trend gate + tick-orderbook confirm
+#   scalp  5% — token only; hasn't earned more (fee-heavy, geometry-broken)
+TIER_BUDGET_FRAC = {"runup": 0.50, "swing": 0.75, "scalp": 0.0, "rally": 0.05}
+# NOTE: fractions deliberately sum >1.0 (opportunistic over-subscription so
+# capital never idles waiting for one tier) — executor.guardrail_block +
+# allocate_margin enforce a GLOBAL cap so total committed margin can never
+# exceed the bankroll; tiers race for the shared headroom first-come.
+# swing raised to 3 slots (2026-07-17, user request) at the $40 bankroll's
+# 75% share ($30 -> $10/slot, matching the old 2-slot size): the 3rd slot is
+# real capacity, not just a number bump — guardrail_block() already checks
+# live free exchange balance before every trade (see executor.py), so it
+# only actually fires when margin isn't already tied up in run-up/bigswing.
+# scalp stays at 1 — weakest tier, hasn't earned more concurrency yet;
+# rally (news + trend + tick-orderbook) also one slot until it earns more
+TIER_MAX_CONCURRENT = {"runup": 4, "swing": 3, "scalp": 0, "rally": 1}
+# runup 2->4 (2026-07-17 audit): earnings_runup sizes its slots as share/
+# RUNUP_MAX_CONCURRENT (=4) but this cap was still 2, so the validated edge
+# could only ever deploy HALF its budget — the two constants must match.
+# scalp -> 0 = tier killed (audit: realized-negative, fee-heaviest at
+# 10-20x, geometry study showed targets near-unreachable). Scalp SIGNALS
+# still analyze/alert; they just can't take real margin.
 # per-name backtested mean net return per run-up event (% notional, 10y)
 RUNUP_EDGE = {
     "xyz:AMD": 2.72, "xyz:MU": 2.54, "xyz:NVDA": 2.34, "xyz:GOOGL": 2.02,
@@ -240,8 +363,13 @@ BIGSWING_ENABLED = _opt("BIGSWING_ENABLED", "0") == "1"
 # (-0.14% to -0.16%/trade); also excluded for the same reason: xyz:INTC,
 # xyz:MSFT, xyz:AMZN (all net-negative-to-flat), xyz:GOOGL/xyz:AAPL (net
 # ~flat, too thin to bother with in a one-slot-at-a-time design).
+# BTC temporarily EXCLUDED from new entries (requested 2026-07-15: "no
+# bitcoin only stocks for now") despite backtesting best of the set — a
+# currently-open BTC position (opened before this change) is NOT affected,
+# it keeps being managed normally to its own exit; this only blocks bigswing
+# from opening a NEW BTC position. Re-add "BTC" to the set below to resume.
 BIGSWING_MARKETS = [m for m in MARKETS if m.coin in
-                    {"BTC", "xyz:HOOD", "xyz:MU", "xyz:AMD", "xyz:NVDA", "xyz:TSLA"}]
+                    {"xyz:HOOD", "xyz:MU", "xyz:AMD", "xyz:NVDA", "xyz:TSLA"}]
 BIGSWING_MIN_LEVERAGE = 5
 BIGSWING_MAX_LEVERAGE = 10
 BIGSWING_MIN_CONVICTION = 0.4                 # backtest sweep: 0.4 beat both 0.5
@@ -271,10 +399,36 @@ BIGSWING_ADOPT_MANUAL = True                  # detect + manage a manually-opene
                                                # same de-risk/equity-stop rules)
 BIGSWING_ADOPT_SKIP_IF_STOP_EXISTS = True     # don't double-bracket a manual trade
                                                # that already has a resting stop/tp
-BIGSWING_PAUSE_OTHER_TIERS = True             # scalp/swing/runup auto-execution
-                                               # pauses new entries while bigswing
-                                               # holds a position — one wallet, one
-                                               # full-balance claim at a time
+BIGSWING_PAUSE_OTHER_TIERS = True             # scalp/swing/runup/rally are NOT
+                                               # started at all when bigswing is
+                                               # on (main.py), AND executor
+                                               # guardrails refuse their entries
+                                               # — one wallet, one strategy, no
+                                               # mixing. Flip to False only if
+                                               # you deliberately want tiers to
+                                               # share the account again.
+# PAUSE bigswing WITHOUT abandoning an open position (2026-07-16, user request
+# to de-risk): when set, bigswing still RESUMES and MANAGES a position it
+# already holds (keeps the watcher, stop/target, de-risk rules) but opens NO
+# new entries and adopts no manual ones — and its exclusivity is lifted so the
+# diversified run-up-backbone tiers take back over once the open position
+# closes and frees the margin. Cleaner than BIGSWING_ENABLED=0, which would
+# orphan the live position (bracket stays on the exchange but nothing records
+# its exit). Flip back to 0 to resume full bigswing.
+BIGSWING_PAUSE_ENTRIES = _opt("BIGSWING_PAUSE_ENTRIES", "0") == "1"
+BIGSWING_REENTRY_COOLDOWN_S = 2 * 3600        # after ANY bigswing exit on a coin,
+                                               # wait this long before re-entering
+                                               # the SAME coin (today's MU churn:
+                                               # FADE profit @12:42 → reload 32s
+                                               # later → gave the win back). Does
+                                               # not block a DIFFERENT coin.
+BIGSWING_REQUIRE_SECONDARY = True             # refuse trend-ONLY entries: need a
+                                               # Donchian breakout OR a sustained
+                                               # book-imbalance sample too. The
+                                               # 11:03 / 13:08 MU shorts that
+                                               # cleared the 0.4 bar on trend
+                                               # alone (breakout=none, book n/a)
+                                               # are exactly what this blocks.
 BIGSWING_MAX_HOLD_HOURS = 7 * 24              # 7 days — longer than the news-tier swing
 BIGSWING_SAMPLE_S = 30                        # entry-scan / adoption-check cadence
 BIGSWING_TREND_DAYS = 10                      # trend-slope lookback (candles.py)
@@ -291,6 +445,68 @@ BIGSWING_NEWS_WINDOW_S = 4 * 3600             # how long a news read still count
 BIGSWING_NEWS_BOOST_MIN_CONF = 0.6            # confidence floor for a confirm boost
 BIGSWING_NEWS_BOOST_AMOUNT = 0.15             # conviction added on confirmation
 BIGSWING_NEWS_VETO_MIN_CONF = 0.75            # confidence floor for a hard veto
+
+# --- News + orderbook + trend rally tier ("rally") ----------------------------
+# Standalone, fractional-budget tier (NOT full-balance like bigswing). A
+# Claude news catalyst ARMS a coin when per-asset + broad-market trend agree
+# (or don't strongly oppose); entry only fires when the LIVE orderbook
+# confirms tick-by-tick (not the 30s/15m sampled windows used elsewhere).
+# Off by default — the tick-level half cannot be classically backtested
+# (no historical L2), so run dry/shadow and review journal.rally_arm_stats()
+# before flipping real orders on. See rally.py / rally_signals.py.
+RALLY_ENABLED = _opt("RALLY_ENABLED", "0") == "1"
+# Stock focus (no BTC for now — same scope preference as bigswing); includes
+# names where a news-led momentum chase is plausibly liquid enough.
+RALLY_MARKETS = [m for m in MARKETS if m.coin in
+                 {"xyz:NVDA", "xyz:TSLA", "xyz:AMD", "xyz:MU", "xyz:HOOD",
+                  "xyz:META", "xyz:AAPL", "xyz:MSFT", "xyz:GOOGL", "xyz:AMZN"}]
+RALLY_LEVERAGE = 5
+RALLY_STOP_RAW = 0.02                         # 2% raw stop (between scalp 0.5%
+                                               # and swing 3% — momentum chase)
+RALLY_TARGET_R = 2.0
+RALLY_MAX_HOLD_HOURS = 24                     # flatten within a day; not a swing
+RALLY_ARM_WINDOW_S = 30 * 60                  # how long a news read keeps a coin
+                                               # armed waiting for book confirm
+RALLY_NEWS_MIN_CONF = 0.60                    # Claude confidence floor to arm
+RALLY_TREND_DAYS = 10                         # per-asset + broad-market lookback
+RALLY_TREND_VETO_PCT = 4.0                    # if per-asset trend_slope opposes
+                                               # the news direction by >= this %,
+                                               # refuse to arm (don't fight the
+                                               # name's own multi-day tape)
+RALLY_BROAD_MARKET = "xyz:SP500"              # regime proxy for stock perps
+RALLY_BROAD_MARKET_VETO = True                # also veto when the broad market
+                                               # slope strongly opposes direction
+RALLY_BOOK_IMBALANCE = 0.65                   # tick book side fraction to confirm
+                                               # (long needs >= this, short <= 1-)
+RALLY_FLOW_WINDOW_S = 5.0                     # short aggression window (trades)
+RALLY_FLOW_MIN_RATIO = 0.60                   # buys/(buys+sells) for long confirm
+                                               # (mirrors 1- for short)
+RALLY_SAMPLE_S = 5                            # arming-sweep cadence (book ticks
+                                               # themselves fire entries instantly)
+RALLY_CANDLE_REFRESH_S = 1800                 # 30 min — shared candles module
+
+# --- Smart-money watchlist (confirmation layer, see smartmoney.py) ------------
+# Tracks the beta-controlled SKILL wallets + the $11M whale from wallet
+# research. Annotates news alerts with how demonstrated-skill wallets are
+# positioned on the same coin. Default = annotate/confirm only (NOT a gate);
+# flip SMARTMONEY_VETO on later, after watching, to actually block entries the
+# whale sits opposite to. Edges are thin (0.2-0.6%/4h) so validate before it
+# ever touches the trade decision.
+SMARTMONEY_ENABLED = _opt("SMARTMONEY_ENABLED", "1") == "1"
+SMARTMONEY_VETO = _opt("SMARTMONEY_VETO", "0") == "1"
+# WEIGHTED into the decision (2026-07-16): smart-money positioning nudges the
+# signal's EFFECTIVE conviction up (confirm) / down (oppose), which then flows
+# into BOTH the entry bar (an oppose can drag a marginal signal below the tier
+# floor and block it) AND the position size (allocate_margin scales with
+# conviction). Deltas are small and TOTAL-bounded so a thin edge (0.2-0.6%/4h)
+# can only tip borderline calls, never override a strongly-convicted read.
+SMARTMONEY_WEIGHTED = _opt("SMARTMONEY_WEIGHTED", "1") == "1"
+SMARTMONEY_CONFIRM_SKILL = 0.05      # per skill wallet agreeing
+SMARTMONEY_CONFIRM_WHALE = 0.10      # the $11M whale agreeing
+SMARTMONEY_OPPOSE_SKILL = -0.08      # per skill wallet against
+SMARTMONEY_OPPOSE_WHALE = -0.15      # the whale against (heaviest single input)
+SMARTMONEY_MAX_UP = 0.12             # total confirm nudge cap
+SMARTMONEY_MAX_DOWN = -0.18          # total oppose nudge cap
 
 # --- Endpoints ---------------------------------------------------------------
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
@@ -318,6 +534,18 @@ BOOK_IMBALANCE_THRESHOLD = 0.65 # fraction of top-of-book depth on one side
 ALERT_COOLDOWN_SECONDS = 1800   # min gap between alerts for same coin+direction
 ALERT_BURST_MAX = 3             # max full alerts per burst window (all markets) —
 ALERT_BURST_WINDOW_S = 600      # one macro headline shouldn't fan out to 7 alerts
+
+# --- Overnight crypto SHADOW mode ---------------------------------------------
+# Stocks are dead when the US market is closed (thin xyz books -> the bot's
+# RTH gates block them), so the account otherwise sits idle overnight. Crypto
+# trades 24/7. The crypto backtest (RESULTS.md) found NO validated edge, so
+# this is SHADOW ONLY: when a crypto news signal fires off-hours it is
+# tape-confirmed, logged to shadow_crypto.jsonl with a 4h forward outcome, and
+# announced on Telegram — but NEVER placed as a real order. Analyze the log
+# after a couple weeks; only wire it to real money if it actually shows edge.
+CRYPTO_NIGHT_SHADOW = _opt("CRYPTO_NIGHT_SHADOW", "1") == "1"
+CRYPTO_COINS = {"BTC"}          # deepest 24/7 liquidity; altcoins tested worse
+CRYPTO_SHADOW_HOLD_H = 4        # paper-hold horizon (matches wallet-research fwd4h)
 
 # --- Reversal guard (per-coin signal ledger) ----------------------------------
 # A same-coin direction FLIP within this window, against a recently confident

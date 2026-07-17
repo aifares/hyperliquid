@@ -61,10 +61,16 @@ class HLStream:
 
     BOOK_LEVELS = 10  # how many levels to sum for depth imbalance
 
-    def __init__(self, coins: list[str], on_trade: Callable[[str, Trade], None] | None = None):
+    def __init__(self, coins: list[str],
+                 on_trade: Callable[[str, Trade], None] | None = None,
+                 on_book: Callable[[str, "MarketState"], None] | None = None):
         self.coins = coins
         self.state: dict[str, MarketState] = {c: MarketState(c) for c in coins}
         self.on_trade = on_trade
+        # Fired on every l2Book push (same event-loop thread as the WS
+        # reader) — used by rally_signals for tick-by-tick confirmation of
+        # an already-armed news+trend setup. Must stay cheap / non-blocking.
+        self.on_book = on_book
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -138,6 +144,8 @@ class HLStream:
             st.best_ask = float(asks[0]["px"])
             st.ask_depth = sum(float(l["sz"]) for l in asks[: self.BOOK_LEVELS])
         st.last_update = time.time()
+        if self.on_book:
+            self.on_book(coin, st)
 
     def _on_bbo(self, data) -> None:
         coin = data.get("coin")

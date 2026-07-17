@@ -227,3 +227,14 @@ funding included: curated-set portfolio result moved from +0.35%/trade to
 **+0.34%/trade** (n=815, 48.8% win) — funding is a rounding error here given
 the ~1.3-day average hold; every per-name ranking and the config choices
 above are unchanged.
+
+## Rally news+trend gate proxy (2026-07-15)
+
+`backtests/rally_trend_bt.py` — sanity-checks ONLY the rally arming gate
+(catalyst-day proxy for news + 10d SMA trend veto + SPY broad-market veto).
+Tick-level orderbook confirmation is **not** in this test (no historical L2).
+
+- Unfiltered catalyst days: geom avg **-0.03%**, win 38%
+- Live gate (per-asset + SPY): geom avg **+0.06%**, win 40% (kept 78% of days)
+- VERDICT: gate helps slightly — keep defaults; validate tick-confirm live via
+  `journal.rally_arm_stats()` before enabling real rally orders.

@@ -104,7 +104,7 @@ def _slot(coin: str) -> float:
     backtested per-event mean get proportionally more margin (AMD's edge is
     3x INTC's — its slot should be too)."""
     share = executor.bankroll() * config.TIER_BUDGET_FRAC["runup"]
-    base = share / 2                       # two full-weight slots per share
+    base = share / config.RUNUP_MAX_CONCURRENT   # even split across the max slots
     weight = config.RUNUP_EDGE.get(coin, config.RUNUP_EDGE_MEAN) / config.RUNUP_EDGE_MEAN
     target = min(base * weight, base)      # cap at base; weight only shrinks
     available = share - executor.margin_committed("runup")
@@ -184,7 +184,7 @@ async def _watch(sid: int, coin: str, label: str, entry: float, stop: float,
         if is_live and account_monitor.has_polled():
             live_pos = account_monitor.get(coin)
             if live_pos is None:
-                reason, emoji, note = "EXTERNAL", "🔚", (
+                reason, emoji, note = "VANISHED", "🔚", (
                     "Position no longer exists on the exchange (closed "
                     "manually, the stop fired, or liquidation) — stopping "
                     "the watch, nothing left here to manage.")
@@ -218,7 +218,7 @@ async def _watch(sid: int, coin: str, label: str, entry: float, stop: float,
                     f"{v['headline'][:120]}")
             else:
                 continue
-        if is_live and reason not in ("EXTERNAL", "EXTERNAL_FLIP"):
+        if is_live and reason not in ("VANISHED", "EXTERNAL_FLIP"):
             status = await asyncio.to_thread(executor.close_position_sync, coin)
             print(f"[runup] live close {coin}: {status}")
         pnl_pct = (mid - entry) / entry * 100
@@ -268,9 +268,9 @@ async def run(stream: HLStream) -> None:
     while True:
         today = date.today()
         if executor.bigswing_active():
-            # bigswing claims ~the whole account for its single position —
-            # don't also try to place real run-up orders against the same
-            # wallet while it's holding one.
+            # bigswing claims ~the whole account, exclusively, whenever it's
+            # enabled — don't place real run-up orders against the same
+            # wallet at all while it's on (not just while it holds a fill).
             await asyncio.sleep(POLL_S)
             continue
         for coin in earnings._stock_symbols():

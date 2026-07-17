@@ -37,10 +37,51 @@ from hl_stream import HLStream
 from swing_signals import SwingSignal
 
 _open: dict | None = None   # {"coin", "sid"} while a bigswing position is live
+# coin -> unix ts when a bigswing position on that coin last exited — blocks
+# instant re-entry after FADE/EXTERNAL/STOP (today: MU reloaded 32s after a
+# profitable FADE and gave the win back).
+_cooldown_until: dict[str, float] = {}
 
 
 def is_open() -> bool:
     return _open is not None
+
+
+def _in_cooldown(coin: str) -> bool:
+    until = _cooldown_until.get(coin, 0.0)
+    return time.time() < until
+
+
+def _note_exit(coin: str, reason: str | None) -> None:
+    """Start the re-entry clock. Every exit reason gets the same cooldown —
+    the bug today was specifically FADE→reload, but EXTERNAL/STOP churn on
+    the same coin is just as wasteful."""
+    cd = config.BIGSWING_REENTRY_COOLDOWN_S
+    _cooldown_until[coin] = time.time() + cd
+    print(f"[bigswing] {coin} cooldown {cd/60:.0f}m after exit"
+          f"{f' ({reason})' if reason else ''}")
+
+
+def _seed_cooldowns_from_journal() -> None:
+    """On startup: if we recently exited a bigswing trade, don't immediately
+    re-open it (covers the restart EXTERNAL→reload pattern too)."""
+    cutoff = time.time() - config.BIGSWING_REENTRY_COOLDOWN_S
+    with journal._conn() as c:  # noqa: SLF001
+        rows = c.execute(
+            "SELECT coin, exit_ts, exit_reason FROM signals "
+            "WHERE horizon='bigswing' AND executed=1 AND exit_ts IS NOT NULL "
+            "AND exit_ts >= ? AND exit_reason NOT IN ('ORPHAN','RESTART')",
+            (cutoff,)).fetchall()
+    now = time.time()
+    for coin, exit_ts, reason in rows:
+        until = exit_ts + config.BIGSWING_REENTRY_COOLDOWN_S
+        if until <= now:
+            continue
+        prev = _cooldown_until.get(coin, 0.0)
+        if until > prev:
+            _cooldown_until[coin] = until
+            print(f"[bigswing] seeded {coin} cooldown until "
+                  f"+{(until-now)/60:.0f}m (last exit {reason})")
 
 
 def _leverage_for(conviction: float, max_lev_market: int) -> int:
@@ -82,6 +123,8 @@ async def _try_enter(stream: HLStream) -> None:
     best: SwingSignal | None = None
     best_note = ""
     for market in config.BIGSWING_MARKETS:
+        if _in_cooldown(market.coin):
+            continue
         # evaluate() can hit the network on a cold/stale candles or funding
         # cache (candles.get()/trend.funding_rate()) — to_thread so a slow
         # fetch never stalls the websocket loop or anything else running
@@ -89,6 +132,14 @@ async def _try_enter(stream: HLStream) -> None:
         sig = await asyncio.to_thread(swing_signals.evaluate, market.coin)
         if sig.direction == "none":
             continue
+        # Trend alone was enough to clear MIN_CONVICTION today (MU shorts with
+        # breakout=none / book n/a) — those were the weak ones. Require a
+        # second vote: Donchian breakout OR a sustained book sample.
+        if config.BIGSWING_REQUIRE_SECONDARY:
+            if sig.breakout == "none" and sig.imbalance is None:
+                print(f"[bigswing] skip {sig.coin}: trend-only "
+                      f"(conv={sig.conviction:.2f}) — need breakout or book")
+                continue
         delta, vetoed, note = _news_adjustment(sig.coin, sig.direction)
         if vetoed:
             print(f"[bigswing] {sig.coin} {sig.direction} technical "
@@ -136,15 +187,23 @@ async def _enter(sig: SwingSignal, news_note: str, stream: HLStream) -> None:
         + (f" / book {sig.imbalance:.2f}" if sig.imbalance is not None else " / book n/a")
         + f" / {sig.liq_note} / {sig.funding_note} / {news_note}"
     )
+    # Account VALUE (equity) doesn't move when free balance gets reallocated
+    # into margin for a new position — safe to snapshot just before placing
+    # the order rather than after, and doing so lets the full decision-input
+    # breakdown (this + conviction/trend/breakout/etc below) get logged in
+    # the SAME journal row the order itself creates, not a follow-up UPDATE.
+    equity_baseline = account_monitor.account_value()
 
     result, sid = await executor.execute_bigswing(
         coin=sig.coin, label=market.label, direction=sig.direction,
-        entry_ref=entry, stop=stop, target=target, leverage=leverage, margin=margin)
+        entry_ref=entry, stop=stop, target=target, leverage=leverage, margin=margin,
+        conviction=sig.conviction, trend_pct=sig.trend_pct, breakout=sig.breakout,
+        imbalance=sig.imbalance, liq_note=sig.liq_note, funding_note=sig.funding_note,
+        news_note=news_note, equity_baseline=equity_baseline)
     if not sid:
         print(f"[bigswing] entry blocked for {sig.coin}: {result}")
         return
 
-    equity_baseline = account_monitor.account_value()
     _open = {"coin": sig.coin, "sid": sid}
     mode = "DRY RUN" if executor.DRY_RUN else "LIVE"
     await notifier.send(
@@ -173,6 +232,16 @@ async def _manage(sid: int, coin: str, label: str, direction: str, entry: float,
             stream=stream, opened=opened, equity_baseline=equity_baseline,
         )
     finally:
+        reason = None
+        try:
+            with journal._conn() as c:  # noqa: SLF001
+                row = c.execute(
+                    "SELECT exit_reason FROM signals WHERE id=?", (sid,)
+                ).fetchone()
+                reason = row[0] if row else None
+        except Exception:  # noqa: BLE001 — cooldown still fires without reason
+            pass
+        _note_exit(coin, reason)
         _open = None
 
 
@@ -221,14 +290,15 @@ async def _adopt(coin: str, stream: HLStream) -> None:
             bracket_note = await asyncio.to_thread(
                 executor.attach_bracket_sync, coin, direction, abs(pos.size), stop, target)
 
+    equity_baseline = account_monitor.account_value()
     sid = journal.log_signal(
         coin=coin, direction=direction, confidence=1.0, magnitude=1.0,
         leverage=leverage, entry=entry, headline="bigswing adopted manual entry",
         rationale="user-opened position adopted for management", tape_note=bracket_note,
-        horizon="bigswing", stop=None if skip_bracket else stop)
+        horizon="bigswing", stop=None if skip_bracket else stop,
+        target=None if skip_bracket else target, equity_baseline=equity_baseline)
     journal.mark_executed(sid, dry_run=executor.DRY_RUN, margin=pos.margin_used)
 
-    equity_baseline = account_monitor.account_value()
     _open = {"coin": coin, "sid": sid}
     stop_line = "using your own resting order(s)" if skip_bracket else f"stop {stop:g} / target {target:g}"
     await notifier.send(
@@ -297,17 +367,30 @@ async def run(stream: HLStream) -> None:
     # would silently disable the safety net for the resumed trade forever.
     while not account_monitor.has_polled():
         await asyncio.sleep(1)
+    _seed_cooldowns_from_journal()
     resumed = _resume(stream)
     if resumed:
         print(f"[bigswing] resumed {resumed} open position(s) from the journal")
     print(f"[bigswing] tier active: full-balance sizing, "
           f"{config.BIGSWING_MIN_LEVERAGE}-{config.BIGSWING_MAX_LEVERAGE}x, "
           f"{'adopts' if config.BIGSWING_ADOPT_MANUAL else 'ignores'} manual entries, "
+          f"reentry cooldown {config.BIGSWING_REENTRY_COOLDOWN_S/60:.0f}m, "
+          f"{'secondary confirm required' if config.BIGSWING_REQUIRE_SECONDARY else 'trend-only ok'}, "
           f"{'DRY RUN' if executor.DRY_RUN else 'LIVE'}")
+    if config.BIGSWING_PAUSE_ENTRIES:
+        print("[bigswing] ⏸️  ENTRIES PAUSED — managing the open position to "
+              "completion, opening no new bets; other tiers take over as margin frees")
     while True:
         swing_signals.sample_book(stream)
+        # Paused mode: keep managing whatever's already open (the watcher armed
+        # by _resume above), but never open/adopt a new full-balance position.
+        # Adoption runs even while entries are paused: adopting a manual
+        # position is PROTECTION (bracket + de-risk + equity net), not a new
+        # bet — only FRESH entries respect the pause. Found 2026-07-17: a
+        # manual MU long sat live with no stop because adoption was inside
+        # the pause check.
         if not is_open():
             adopted = await _check_adopt(stream)
-            if not adopted:
+            if not adopted and not config.BIGSWING_PAUSE_ENTRIES:
                 await _try_enter(stream)
         await asyncio.sleep(config.BIGSWING_SAMPLE_S)

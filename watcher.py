@@ -31,6 +31,7 @@ def _live_executed(signal_id: int) -> bool:
 SCALP_MAX_HOLD_S = 4 * 3600
 SWING_MAX_HOLD_S = 72 * 3600
 BIGSWING_MAX_HOLD_S = config.BIGSWING_MAX_HOLD_HOURS * 3600
+RALLY_MAX_HOLD_S = config.RALLY_MAX_HOLD_HOURS * 3600
 POLL_S = 2.0
 RECONCILE_S = 10.0       # how often to re-check the REAL position (live trades
                          # only — matches account_monitor's own poll cadence,
@@ -38,28 +39,38 @@ RECONCILE_S = 10.0       # how often to re-check the REAL position (live trades
 FADE_STRENGTH = 0.6      # opposing tape strength that counts as momentum death
 # FADE must not scratch trades seconds after entry on tape flicker: require a
 # minimum hold AND a minimum profit (in R = stop distance) before it can fire.
-FADE_MIN_HOLD_S = {"scalp": 180, "swing": 3600, "bigswing": 3600}
-FADE_MIN_PROFIT_R = {"scalp": 0.5, "swing": 1.0, "bigswing": 1.0}
+FADE_MIN_HOLD_S = {"scalp": 180, "swing": 3600, "bigswing": 3600, "rally": 900}
+FADE_MIN_PROFIT_R = {"scalp": 0.5, "swing": 1.0, "bigswing": 1.0, "rally": 0.75}
 
-_veto: dict[str, dict] = {}   # coin -> {"conf","mag","headline","ts"} armed early-exit
+_veto: dict[str, dict] = {}   # coin -> {...} armed full early-exit
+_ratchet: set[str] = set()    # coins to ratchet the stop to breakeven (in profit)
 
 
-def flag_bearish(coin: str, confidence: float, magnitude: float, headline: str) -> bool:
-    """Called from combiner when a signal opposes a currently-held scalp/swing
-    position (direction already confirmed opposite by the caller). Arms an
-    early NEWS exit — same conviction bars as the run-up veto, since FADE only
-    protects a position that's already winning; a losing trade has nothing
-    else to catch a genuinely dead thesis before the clock runs out. Returns
-    whether it actually armed, so the caller can tell the user which happened."""
+def news_response(coin: str, confidence: float, magnitude: float,
+                  headline: str) -> str | None:
+    """Called from combiner when a signal opposes a currently-held scalp/
+    swing/bigswing/rally position (opposite direction already confirmed by
+    the caller). Three-tier, asymmetric by design — see config: it should be
+    EASIER to protect a position than to open one.
+      'exit'    -> full early close armed (strong bad news)
+      'protect' -> breakeven-stop ratchet armed (medium bad news; the watcher
+                   only acts on it if the position is actually in profit)
+      None      -> below both bars, caller should warn only
+    """
     if not config.NEWS_EXIT_SCALP_SWING:
-        return False
-    if confidence < config.NEWS_EXIT_MIN_CONF or magnitude < config.NEWS_EXIT_MIN_MAG:
-        return False
-    _veto[coin] = {"conf": confidence, "mag": magnitude,
-                   "headline": headline, "ts": time.time()}
-    print(f"[watcher] 📰 NEWS-VETO armed for {coin} "
-          f"(conf {confidence:.2f}, mag {magnitude:.2f}) — {headline[:80]!r}")
-    return True
+        return None
+    if confidence >= config.NEWS_EXIT_MIN_CONF and magnitude >= config.NEWS_EXIT_MIN_MAG:
+        _veto[coin] = {"conf": confidence, "mag": magnitude,
+                       "headline": headline, "ts": time.time()}
+        print(f"[watcher] 📰 NEWS-EXIT armed for {coin} "
+              f"(conf {confidence:.2f}, mag {magnitude:.2f}) — {headline[:80]!r}")
+        return "exit"
+    if confidence >= config.NEWS_PROTECT_MIN_CONF and magnitude >= config.NEWS_PROTECT_MIN_MAG:
+        _ratchet.add(coin)
+        print(f"[watcher] 🛡️ NEWS-PROTECT armed for {coin} "
+              f"(conf {confidence:.2f}, mag {magnitude:.2f}) — breakeven if in profit")
+        return "protect"
+    return None
 
 
 def target_price(entry: float, stop: float, direction: str, r_mult: float = 2.0) -> float:
@@ -73,17 +84,23 @@ def target_price(entry: float, stop: float, direction: str, r_mult: float = 2.0)
 async def watch(*, signal_id: int, coin: str, label: str, direction: str,
                 entry: float, stop: float, horizon: str, leverage: int,
                 stream: HLStream, opened: float | None = None,
-                equity_baseline: float | None = None) -> None:
+                equity_baseline: float | None = None,
+                partial_done: bool = False) -> None:
     """equity_baseline is bigswing-only: the account equity snapshot at
     entry/adoption time, used by the hard equity safety net below. Ignored
-    for scalp/swing/runup."""
-    r_mult = config.BIGSWING_TARGET_R if horizon == "bigswing" else 2.0
+    for scalp/swing/runup. partial_done=True on resume means the 1R half was
+    already banked in a previous run (journal.partial_px) — never bank twice."""
+    r_mult = (config.BIGSWING_TARGET_R if horizon == "bigswing"
+              else config.RALLY_TARGET_R if horizon == "rally"
+              else 2.0)
     tgt = target_price(entry, stop, direction, r_mult)
     opened = opened or time.time()
     if horizon == "scalp":
         max_hold = SCALP_MAX_HOLD_S
     elif horizon == "bigswing":
         max_hold = BIGSWING_MAX_HOLD_S
+    elif horizon == "rally":
+        max_hold = RALLY_MAX_HOLD_S
     else:
         max_hold = SWING_MAX_HOLD_S
     deadline = opened + max_hold
@@ -93,6 +110,19 @@ async def watch(*, signal_id: int, coin: str, label: str, direction: str,
     # check only applies to genuinely live trades.
     is_live = not executor.DRY_RUN and _live_executed(signal_id)
     next_reconcile = time.time() + RECONCILE_S
+    # Partial-exit state: peak_profit drives the runner's 1R trail. Resumed
+    # trades seed partial_done from the journal so the half is never banked
+    # twice across restarts. Partials apply to swing/bigswing/rally only —
+    # run-up keeps its validated exit shape, scalp is dead (0 slots).
+    partial_ok = (config.PARTIAL_EXIT
+                  and horizon in ("swing", "bigswing", "rally"))
+    peak_profit = 0.0
+    if partial_done:
+        # Resumed after the half was already banked: the runner must come
+        # back breakeven-protected, whatever the frozen entry-time stop was.
+        stop = max(stop, entry) if long else min(stop, entry)
+        tgt = (entry + config.PARTIAL_RUNNER_TARGET_R * risk if long
+               else entry - config.PARTIAL_RUNNER_TARGET_R * risk)
 
     while True:
         await asyncio.sleep(POLL_S)
@@ -107,7 +137,11 @@ async def watch(*, signal_id: int, coin: str, label: str, direction: str,
             next_reconcile = time.time() + RECONCILE_S
             live_pos = account_monitor.get(coin)
             if live_pos is None:
-                reason, emoji, note = "EXTERNAL", "🔚", (
+                # VANISHED (not the old catch-all EXTERNAL): distinct code so
+                # attribution queries can separate "left the exchange outside
+                # the bot's own exits" from restart force-closes (ORPHAN) and
+                # deliberate manual flips (EXTERNAL_FLIP).
+                reason, emoji, note = "VANISHED", "🔚", (
                     "Position no longer exists on the exchange (closed "
                     "manually, an exchange-side order filled, or liquidation) "
                     "— stopping the watch, nothing left here to manage.")
@@ -126,19 +160,103 @@ async def watch(*, signal_id: int, coin: str, label: str, direction: str,
                       f"— recomputing stop/target off the real position")
                 entry = live_pos.entry
                 leverage = live_pos.leverage or leverage
+                # Persist the correction too — without this the journal row
+                # keeps the stale decision-time reference price forever, even
+                # though the bot itself moves on to the real one in memory
+                # (matters for building a backtest off real trade records).
+                journal.update_entry(signal_id, entry)
                 # A resize is itself a new event — the original entry/stop
                 # relationship no longer applies regardless of whether this
                 # trade predates the geometry fix, so recompute fresh here
                 # (unlike resume_live, which must preserve a pre-fix trade's
                 # frozen stop across a plain restart).
-                stop = notifier.stop_price(entry, direction, horizon)
+                stop = notifier.stop_price(entry, direction, horizon, coin)
                 tgt = target_price(entry, stop, direction, r_mult)
                 risk = abs(entry - stop)
+                if partial_ok and partial_done:
+                    # a resized runner keeps its breakeven protection
+                    stop = max(stop, entry) if long else min(stop, entry)
+                    tgt = (entry + config.PARTIAL_RUNNER_TARGET_R * risk if long
+                           else entry - config.PARTIAL_RUNNER_TARGET_R * risk)
 
         if reason is None:
             if mid <= 0:
                 continue
             profit = (mid - entry) if long else (entry - mid)
+
+            # News-protect ratchet: bad news too weak to justify a full exit,
+            # but enough to stop risking the gain. Only acts when in profit —
+            # move the stop to breakeven (non-destructive: we stay in, but the
+            # trade can't turn into a loss from here). Underwater positions are
+            # left to the price stop and the higher full-exit bar; we do NOT
+            # force a loss-close on medium news.
+            if coin in _ratchet:
+                _ratchet.discard(coin)
+                # Require a REAL cushion (>=1R) before ratcheting to breakeven.
+                # profit>0 alone was the SPCX bug: a +1% short got its stop
+                # snapped to the entry-price magnet, and a tiny bounce shook it
+                # out at breakeven 2h before a -10% crash. At >=1R the position
+                # is well clear of entry, so a retest back to breakeven is a
+                # genuine reversal worth protecting against, not noise. Move
+                # ONLY the stop — recomputing tgt/risk off a breakeven stop
+                # would zero the risk and collapse the target onto entry.
+                if profit >= risk and ((long and entry > stop) or (not long and entry < stop)):
+                    stop = entry
+                    print(f"[watcher] 🛡️ {coin} stop -> breakeven {entry:g} "
+                          f"(news-protect, up >=1R)")
+                else:
+                    print(f"[watcher] news-protect on {coin} skipped — only up "
+                          f"{profit:g} (< 1R {risk:g}); not snapping to breakeven")
+
+            # --- partial exit at 1R + trailed runner (audit 2026-07-17) ----
+            # Zero of 45 trades ever reached the 2R target; winners exited
+            # via FADE at ~1R, making realized geometry symmetric (1R win vs
+            # 1R loss at 39% win rate = negative). At +1R: bank half, move
+            # the stop on the rest to breakeven (the trade can no longer
+            # lose), and let the runner ride toward 3R behind a 1R trail.
+            peak_profit = max(peak_profit, profit)
+            if partial_ok and not partial_done and profit >= risk > 0:
+                live_pos = account_monitor.get(coin) if is_live else None
+                if is_live and live_pos is None:
+                    pass   # gone from the exchange — reconcile handles it
+                elif (live_pos is not None
+                      and abs(live_pos.size) * mid < config.PARTIAL_MIN_NOTIONAL):
+                    # too small to split into two >=$10 pieces: skip the bank,
+                    # keep the whole position but still breakeven-protect it
+                    partial_done = True
+                    stop = max(stop, entry) if long else min(stop, entry)
+                    tgt = (entry + config.PARTIAL_RUNNER_TARGET_R * risk if long
+                           else entry - config.PARTIAL_RUNNER_TARGET_R * risk)
+                    print(f"[watcher] 💰 {coin} at +1R but notional too small "
+                          f"to split — breakeven + trail on the full size")
+                else:
+                    bank_note = "paper"
+                    if is_live:
+                        await executor._load_sz_decimals()  # noqa: SLF001
+                        bank_note = await asyncio.to_thread(
+                            executor.partial_close_sync, coin,
+                            config.PARTIAL_EXIT_FRAC)
+                    partial_done = True
+                    journal.mark_partial(signal_id, mid)
+                    stop = entry
+                    tgt = (entry + config.PARTIAL_RUNNER_TARGET_R * risk if long
+                           else entry - config.PARTIAL_RUNNER_TARGET_R * risk)
+                    print(f"[watcher] 💰 PARTIAL {coin} @ {mid:g} (+1R): "
+                          f"{bank_note}; runner -> breakeven stop, "
+                          f"{config.PARTIAL_RUNNER_TARGET_R:g}R target")
+                    await notifier.send(
+                        f"💰 <b>Banked half your {direction.upper()} {label}"
+                        f"</b> ({coin}, {horizon}) at +1R\n"
+                        f"<b>Entry:</b> {entry:g} → <b>Now:</b> {mid:g}\n"
+                        f"{bank_note}\n"
+                        f"<i>Runner: stop moved to breakeven (can't lose from "
+                        f"here), trailing 1R behind the best price toward "
+                        f"{config.PARTIAL_RUNNER_TARGET_R:g}R.</i>")
+            if partial_ok and partial_done:
+                # 1R trail from the high-water mark — only ever tightens
+                trail = ((entry + peak_profit) - risk if long
+                         else (entry - peak_profit) + risk)
+                stop = max(stop, trail) if long else min(stop, trail)
 
             # --- bigswing-only guardrails (checked ahead of the normal
             # stop/target so they act as an override, not an afterthought) --
@@ -157,10 +275,17 @@ async def watch(*, signal_id: int, coin: str, label: str, direction: str,
                     f"independent of the resting price stop, in case a gap jumped "
                     f"past it or the trigger order failed.")
             elif (long and mid <= stop) or (not long and mid >= stop):
-                reason, emoji, note = "STOP", "🛑", "Stop hit — exit now, thesis invalidated."
+                if partial_done and profit > 0:
+                    reason, emoji, note = "TRAIL", "🏁", (
+                        "Trailing stop hit — runner gave back 1R from its best "
+                        "price; banking the rest in profit (half was already "
+                        "taken at +1R).")
+                else:
+                    reason, emoji, note = "STOP", "🛑", "Stop hit — exit now, thesis invalidated."
             elif (long and mid >= tgt) or (not long and mid <= tgt):
                 reason, emoji, note = "TARGET", "🎯", "2R target reached — take profit / trail the rest."
             elif (horizon == "bigswing" and coin.startswith("xyz:")
+                  and coin not in config.CONTINUOUS_MARKETS
                   and market_hours.closing_soon() and profit < risk):
                 reason, emoji, note = "OFFHOURS_DERISK", "🌙", (
                     "Market closing soon and this trade isn't up >=1R yet — "
@@ -195,10 +320,10 @@ async def watch(*, signal_id: int, coin: str, label: str, direction: str,
 
         # Live positions must actually leave the exchange: FADE/TIME have no
         # resting order, STOP/TARGET leave a sibling trigger to cancel. Skip
-        # this for EXTERNAL (already gone — nothing to close) and
+        # this for VANISHED (already gone — nothing to close) and
         # EXTERNAL_FLIP (a human changed it deliberately — the bot must not
         # touch a position it no longer recognizes, only stop watching it).
-        if is_live and reason not in ("EXTERNAL", "EXTERNAL_FLIP"):
+        if is_live and reason not in ("VANISHED", "EXTERNAL_FLIP"):
             status = await asyncio.to_thread(executor.close_position_sync, coin)
             print(f"[watcher] live close {coin}: {status}")
 
@@ -210,7 +335,8 @@ async def watch(*, signal_id: int, coin: str, label: str, direction: str,
         )
         await notifier.send(text)
         journal.record_exit(signal_id, exit_px=mid, reason=reason)
-        _veto.pop(coin, None)   # position gone; drop any stale veto flag
+        _veto.pop(coin, None)      # position gone; drop any stale flags
+        _ratchet.discard(coin)
         print(f"[watcher] EXIT {reason} {coin} @ {mid} ({pnl_pct:+.2f}% raw)")
         return
 
@@ -229,7 +355,8 @@ def resume_live(stream: HLStream) -> int:
     so a geometry change (SCALP_STOP_RAW/SWING_STOP_RAW) never retroactively
     moves a stop under a position that's already open."""
     n = 0
-    for sid, coin, direction, horizon, lev, entry, ts, stored_stop in journal.open_live_rows():
+    for (sid, coin, direction, horizon, lev, entry, ts, stored_stop,
+         partial_px) in journal.open_live_rows():
         label = config.MARKET_BY_COIN[coin].label if coin in config.MARKET_BY_COIN else coin
         live_pos = account_monitor.get(coin) if account_monitor.has_polled() else None
         if live_pos:
@@ -239,7 +366,7 @@ def resume_live(stream: HLStream) -> int:
         asyncio.create_task(watch(
             signal_id=sid, coin=coin, label=label, direction=direction,
             entry=entry, stop=stop, horizon=horizon, leverage=lev, stream=stream,
-            opened=ts,
+            opened=ts, partial_done=partial_px is not None,
         ))
         n += 1
     return n

@@ -128,6 +128,22 @@ def atr_pct(coin: str, n: int = 14) -> float | None:
     return a / candles[-1].c
 
 
+def atr_pct_cached(coin: str, n: int = 14) -> float | None:
+    """atr_pct from whatever is already in the cache, WITHOUT the lazy
+    blocking refresh get() does on staleness — safe to call from async hot
+    paths (notifier.stop_price at signal time). The background run() task
+    keeps the cache fresh; if this coin was never fetched, returns None and
+    the caller falls back to its fixed-% stop."""
+    candles = _cache.get(coin, [])
+    if len(candles) < n + 1 or candles[-1].c <= 0:
+        return None
+    trs = []
+    for i in range(-n, 0):
+        cur, prev = candles[i], candles[i - 1]
+        trs.append(max(cur.h - cur.l, abs(cur.h - prev.c), abs(cur.l - prev.c)))
+    return (sum(trs) / len(trs)) / candles[-1].c if trs else None
+
+
 async def refresh_all(coins: list[str]) -> None:
     for coin in coins:
         await asyncio.to_thread(refresh, coin)

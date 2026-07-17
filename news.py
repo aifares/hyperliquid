@@ -1,8 +1,11 @@
 """News poller using the Perplexity Sonar API.
 
-Periodically asks Perplexity for fresh, market-moving headlines about the watched
-assets and pushes any *new* items onto the shared event queue. Perplexity does
-real-time web search, so this catches macro/company news between Telegram posts.
+Narrowed 2026-07-17: Alpaca/Benzinga (alpaca_news.py) now covers every
+single-name stock in real time, faster than Sonar's 120s search-poll ever
+could (measured ~2hr lag on the SPCX case). Benzinga has no ticker for BTC
+or the index proxies (XYZ100/SP500) though, and Sonar's broad web search is
+still the only source for macro (Fed, CPI, geopolitics) that moves those —
+so Perplexity's job shrinks to just that: macro/index/BTC, not stocks.
 """
 from __future__ import annotations
 
@@ -18,13 +21,16 @@ from events import NewsEvent
 _SEEN: set[str] = set()          # dedup keys already emitted
 _SEEN_ORDER: list[str] = []      # bounded FIFO for the dedup set
 
-_ASSETS = ", ".join(m.label for m in config.MARKETS)
+_MACRO_COINS = {"BTC", "xyz:XYZ100", "xyz:SP500"}
+_ASSETS = ", ".join(m.label for m in config.MARKETS if m.coin in _MACRO_COINS)
 
 _PROMPT = (
-    f"What are the latest market-moving news headlines for these assets: "
-    f"{_ASSETS}? Focus on macro data, Fed, earnings, regulation, and large "
-    f"price moves. Respond ONLY as a JSON array of objects with keys "
-    f'"headline" and "asset". No prose, no preamble.'
+    f"What are the latest macro and broad-market news headlines affecting "
+    f"these: {_ASSETS}? Focus on Fed policy, CPI/inflation data, geopolitical "
+    f"events, and other macro releases that move the broad market or crypto — "
+    f"NOT single-company news (that's covered by a separate feed). Respond "
+    f"ONLY as a JSON array of objects with keys \"headline\" and \"asset\". "
+    f"No prose, no preamble."
 )
 
 

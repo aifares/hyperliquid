@@ -5,11 +5,22 @@ liquidation price at the configured leverage so the risk is visible at a glance.
 """
 from __future__ import annotations
 
+import html
+
 import aiohttp
 
+import candles
 import config
 
 _API = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+
+
+def esc(text: str) -> str:
+    """HTML-escape free text (headlines, rationales) before it lands inside a
+    parse_mode=HTML message — raw '<'/'&' in a headline makes Telegram reject
+    the whole send with 'can't parse entities' and the alert silently drops
+    (observed 2026-07-16: a run of 400s, alerts lost for 35+ minutes)."""
+    return html.escape(str(text), quote=False)
 
 
 def liquidation_price(entry: float, direction: str, leverage: int) -> float:
@@ -23,17 +34,28 @@ def liquidation_price(entry: float, direction: str, leverage: int) -> float:
     return entry * (1 + frac)
 
 
-def stop_price(entry: float, direction: str, horizon: str = "scalp") -> float:
-    """Fixed-% stop by tier (config.SCALP_STOP_RAW / SWING_STOP_RAW /
-    BIGSWING_STOP_RAW) — for a BRAND NEW entry only. An already-open trade's
-    own stop is frozen in journal.signals.stop at entry time; use
-    resolve_stop() to read it back rather than recomputing here, or a later
-    config edit would silently retighten/loosen a position that's already
-    live."""
+def stop_price(entry: float, direction: str, horizon: str = "scalp",
+               coin: str | None = None) -> float:
+    """Stop for a BRAND NEW entry only. Swing stops are volatility-aware when
+    `coin` is given and ATR_STOPS is on: 1.5x the name's own 14d ATR%,
+    clamped to [ATR_STOP_MIN, ATR_STOP_MAX] — a fixed 3% treated quiet AAPL
+    and 6%-a-day SKHX identically (audit 2026-07-17: SKHX noise-stopped
+    repeatedly). Falls back to the tier's fixed % when no candle history.
+    An already-open trade's stop is frozen in journal.signals.stop at entry
+    time; use resolve_stop() to read it back rather than recomputing here,
+    or a later config edit would silently retighten/loosen a position that's
+    already live."""
     if horizon == "swing":
         frac = config.SWING_STOP_RAW
+        if coin and config.ATR_STOPS:
+            ap = candles.atr_pct_cached(coin)
+            if ap:
+                frac = min(config.ATR_STOP_MAX,
+                           max(config.ATR_STOP_MIN, config.ATR_STOP_MULT * ap))
     elif horizon == "bigswing":
         frac = config.BIGSWING_STOP_RAW
+    elif horizon == "rally":
+        frac = config.RALLY_STOP_RAW
     else:
         frac = config.SCALP_STOP_RAW
     if direction == "long":
@@ -71,7 +93,7 @@ def build_alert(*, label: str, coin: str, direction: str, entry: float,
     tier = "⚡ SCALP (minutes–hours, exit same session)" if horizon == "scalp" \
         else "🌊 SWING (multi-day hold — sized at low leverage)"
     liq = liquidation_price(entry, direction, leverage)
-    stop = stop_price(entry, direction, horizon)
+    stop = stop_price(entry, direction, horizon, coin)
     conv = int(round(confidence * magnitude * 100))
 
     def fmt(x: float) -> str:
@@ -88,9 +110,9 @@ def build_alert(*, label: str, coin: str, direction: str, entry: float,
         f"<b>Stop:</b> {fmt(stop)}",
         f"<b>Liq @ {leverage}x:</b> {fmt(liq)}",
         "",
-        f"<b>Why:</b> {rationale}",
-        f"<b>Headline:</b> {headline}",
-        f"<b>Tape:</b> {tape_note}",
+        f"<b>Why:</b> {esc(rationale)}",
+        f"<b>Headline:</b> {esc(headline)}",
+        f"<b>Tape:</b> {esc(tape_note)}",
     ]
     if off_hours_note:
         lines += ["", off_hours_note]
@@ -112,7 +134,7 @@ def build_exit_alert(*, label: str, coin: str, direction: str, entry: float,
         f"(≈ {(pnl_pct - config.ROUND_TRIP_FEE * 100) * leverage:+.1f}% on margin "
         f"at {leverage}x, net of fees)\n"
         f"\n"
-        f"{note}\n"
+        f"{esc(note)}\n"
         f"\n"
         f"<i>Not financial advice. Notifier only — confirm before trading.</i>"
     )

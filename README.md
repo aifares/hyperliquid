@@ -36,6 +36,12 @@ It fuses live news with live order-flow and pings your Telegram when they agree.
   the existing news pipeline as a secondary confirm/veto only. Disabled by
   default (`BIGSWING_ENABLED=0`) — see "Full-balance swing tier" below before
   turning it on.
+- **🚀💰 News+orderbook+trend rally tier ("rally", `RALLY_ENABLED`):** a
+  separate fractional-budget tier — Claude news ARMS a coin when per-asset +
+  broad-market trend agree, then entry fires the instant the live orderbook
+  confirms tick-by-tick (`rally_signals.py` + `HLStream.on_book`). Disabled
+  by default; tick-L2 cannot be classically backtested — run dry/shadow and
+  check `journal.rally_arm_stats()` before real orders.
 
 ## Architecture
 
@@ -64,6 +70,8 @@ Hyperliquid WS ─► tick engine ─────────────► tap
 | `candles.py` | live daily OHLC fetch/cache — trend, Donchian breakout, ATR |
 | `swing_signals.py` | bigswing's technical/orderbook conviction scorer |
 | `bigswing.py` | full-balance swing tier: entry engine + manual-position adoption |
+| `rally_signals.py` | rally tier: news+trend arm + tick-book confirmation |
+| `rally.py` | rally tier driver (fractional budget) |
 
 ## Setup
 
@@ -107,9 +115,9 @@ survivable. The guardrails below exist specifically to address that finding
   dry-run for a stretch and check `journal.summary()` before going live.**
 - **Sizing:** one position at a time, margin = nearly all of
   `account_monitor.spot_available()` (not the shared `TOTAL_BANKROLL`).
-  While it holds a position, the scalp/swing/runup tiers pause new entries
-  so they don't compete for the same real margin
-  (`BIGSWING_PAUSE_OTHER_TIERS`).
+  Whenever bigswing is enabled, the scalp/swing/runup tiers are paused
+  entirely — not just while bigswing happens to hold a fill — so they can
+  never compete for the same real margin (`BIGSWING_PAUSE_OTHER_TIERS`).
 - **Signal:** primary trigger is technical/orderbook (`swing_signals.py`),
   not news — the existing Claude pipeline only nudges conviction up on
   agreement or vetoes an entry on a strongly opposing, high-confidence read
@@ -128,6 +136,26 @@ survivable. The guardrails below exist specifically to address that finding
     position yourself on a watched coin, bigswing detects and manages it
     too (same de-risk + equity-stop rules; skips adding its own stop/target
     if you already have a resting one, `BIGSWING_ADOPT_SKIP_IF_STOP_EXISTS`).
+
+## News + orderbook + trend rally tier ("rally")
+
+Standalone fractional-budget tier (shares `TOTAL_BANKROLL`; never full-balance).
+**Off by default** (`RALLY_ENABLED=0`). Tick-level L2 history isn't available,
+so this cannot be classically backtested end-to-end — the news+trend gate has
+a historical proxy in `backtests/rally_trend_bt.py`, and live/shadow outcomes
+live in `journal.rally_arm_stats()`.
+
+- **Arm:** a fresh Claude news read (`combiner.latest_read`) with confidence
+  ≥ `RALLY_NEWS_MIN_CONF`, while per-asset and broad-market
+  (`RALLY_BROAD_MARKET`, default `xyz:SP500`) trend slopes don't strongly
+  oppose (`RALLY_TREND_VETO_PCT`).
+- **Fire:** `HLStream.on_book` confirms tick-by-tick — book imbalance past
+  `RALLY_BOOK_IMBALANCE` AND short-window trade flow past
+  `RALLY_FLOW_MIN_RATIO`, same direction as the arm.
+- **Size/risk:** `RALLY_LEVERAGE` (5x), `RALLY_STOP_RAW` (2%), 2R target,
+  max hold `RALLY_MAX_HOLD_HOURS` (24h). One concurrent slot.
+- While `BIGSWING_ENABLED` + `BIGSWING_PAUSE_OTHER_TIERS`, rally entries are
+  blocked (confirms still journal as `confirmed_blocked` for validation).
 
 ## Risk notes
 

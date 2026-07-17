@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timedelta, timezone
 
 import logsetup
 
@@ -23,6 +24,7 @@ import config
 import earnings
 import earnings_runup
 import news
+import rally
 import tg_buttons
 import tg_reader
 import watcher
@@ -32,6 +34,26 @@ from events import NewsEvent
 from hl_stream import HLStream
 
 SHADOW_MODE = os.getenv("SHADOW_MODE", "0") == "1"
+DAILY_REVIEW_UTC_HOUR = 20   # ~16:00 ET (US close) in summer -> daily wrap-up
+
+
+async def _daily_review_loop() -> None:
+    """Once a day after the US close, build the trade review and Telegram the
+    summary. Read-only (never trades); a failure here must never break the bot."""
+    import notifier
+    import daily_review as dr
+    while True:
+        now = datetime.now(tz=timezone.utc)
+        target = now.replace(hour=DAILY_REVIEW_UTC_HOUR, minute=5, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            summary, _ = await asyncio.to_thread(dr.build_review)
+            await notifier.send(summary + "\n<i>full report saved to research/daily/</i>")
+            print("[daily-review] sent")
+        except Exception as e:  # noqa: BLE001
+            print(f"[daily-review] failed: {e!r}")
 
 
 async def _analyzer_loop(queue: "asyncio.Queue[NewsEvent]", stream: HLStream) -> None:
@@ -95,7 +117,9 @@ async def main() -> None:
               f"at current prices")
     queue: asyncio.Queue[NewsEvent] = asyncio.Queue()
     coins = [m.coin for m in config.MARKETS]
-    stream = HLStream(coins)
+    # rally.on_book is a no-op until rally.run() sets up its confirm queue —
+    # safe to wire unconditionally so the first book tick after enable works.
+    stream = HLStream(coins, on_book=rally.on_book if config.RALLY_ENABLED else None)
 
     resumed_live = watcher.resume_live(stream)
     if resumed_live:
@@ -108,6 +132,9 @@ async def main() -> None:
     ]
     if config.PERPLEXITY_API_KEY:
         tasks.append(asyncio.create_task(news.run(queue), name="news"))
+    if config.ALPACA_API_KEY and config.ALPACA_API_SECRET:
+        import alpaca_news
+        tasks.append(asyncio.create_task(alpaca_news.run(queue), name="alpaca-news"))
     if config.TELEGRAM_API_ID and config.TELEGRAM_API_HASH:
         tasks.append(asyncio.create_task(tg_reader.run(queue), name="telegram"))
     if config.WALLET_ADDRESS:
@@ -117,20 +144,60 @@ async def main() -> None:
         tasks.append(asyncio.create_task(tg_buttons.run(), name="buttons"))
     if config.FINNHUB_API_KEY:
         tasks.append(asyncio.create_task(earnings.run(), name="earnings"))
-        if config.RUNUP_ENABLED:
+        # When bigswing owns the wallet exclusively, don't start run-up —
+        # calendar warnings stay on via earnings. Rally is allowed alongside
+        # bigswing (see below).
+        import executor as _ex
+        if config.RUNUP_ENABLED and not _ex.bigswing_active():
             tasks.append(asyncio.create_task(
                 earnings_runup.run(stream), name="runup"))
+        elif config.RUNUP_ENABLED:
+            print("[runup] not started — bigswing exclusive mode "
+                  "(BIGSWING_PAUSE_OTHER_TIERS)")
         else:
             print("[runup] earnings tier DISABLED (RUNUP_ENABLED=0) — "
                   "calendar warnings stay on")
+
+    # Candles shared by bigswing + rally. Scalp/swing/runup stay paused under
+    # exclusive bigswing; rally is started alongside when RALLY_ENABLED.
+    candle_coins: list[str] = []
+    import executor as _ex2
+    exclusive = _ex2.bigswing_active()
     if config.BIGSWING_ENABLED:
-        bigswing_coins = [m.coin for m in config.BIGSWING_MARKETS]
-        tasks.append(asyncio.create_task(
-            candles.run(bigswing_coins, config.BIGSWING_CANDLE_REFRESH_S),
-            name="candles"))
+        candle_coins.extend(m.coin for m in config.BIGSWING_MARKETS)
         tasks.append(asyncio.create_task(bigswing.run(stream), name="bigswing"))
     else:
         print("[bigswing] full-balance swing tier DISABLED (BIGSWING_ENABLED=0)")
+    if config.RALLY_ENABLED:
+        candle_coins.extend(m.coin for m in config.RALLY_MARKETS)
+        if config.RALLY_BROAD_MARKET not in candle_coins:
+            candle_coins.append(config.RALLY_BROAD_MARKET)
+        tasks.append(asyncio.create_task(rally.run(stream), name="rally"))
+    else:
+        print("[rally] news+book+trend tier DISABLED (RALLY_ENABLED=0)")
+    # ATR stops need daily candles for EVERY tradeable market, not just the
+    # bigswing/rally subsets — one candleSnapshot call per coin per refresh.
+    if config.ATR_STOPS:
+        candle_coins.extend(m.coin for m in config.MARKETS)
+    if candle_coins:
+        seen: set[str] = set()
+        uniq = [c for c in candle_coins if not (c in seen or seen.add(c))]
+        refresh = min(
+            config.BIGSWING_CANDLE_REFRESH_S if config.BIGSWING_ENABLED else 10**9,
+            config.RALLY_CANDLE_REFRESH_S if config.RALLY_ENABLED else 10**9,
+            1800,   # ATR cache: refresh at least every 30 min
+        )
+        tasks.append(asyncio.create_task(
+            candles.run(uniq, refresh), name="candles"))
+    tasks.append(asyncio.create_task(_daily_review_loop(), name="daily-review"))
+    if config.SMARTMONEY_ENABLED:
+        import smartmoney
+        tasks.append(asyncio.create_task(smartmoney.run(), name="smartmoney"))
+    import funding
+    tasks.append(asyncio.create_task(funding.run(), name="funding"))
+    if config.KOREA_ENABLED:
+        import korea
+        tasks.append(asyncio.create_task(korea.run(stream), name="korea"))
 
     from analyzer import MODEL as ANALYZER_MODEL
     from executor import DRY_RUN
@@ -139,14 +206,20 @@ async def main() -> None:
     exec_mode = "DRY-RUN (simulated fills)" if DRY_RUN else "LIVE (real orders)"
     bigswing_mode = (
         f"ENABLED ({config.BIGSWING_MIN_LEVERAGE}-{config.BIGSWING_MAX_LEVERAGE}x, "
-        f"full-balance, {'adopts' if config.BIGSWING_ADOPT_MANUAL else 'ignores'} "
+        f"full-balance, exclusive_vs_scalp/swing/runup={exclusive}, "
+        f"{'adopts' if config.BIGSWING_ADOPT_MANUAL else 'ignores'} "
         f"manual entries)" if config.BIGSWING_ENABLED else "disabled"
+    )
+    rally_mode = (
+        f"ENABLED ({config.RALLY_LEVERAGE}x, news+trend arm → tick-book confirm)"
+        if config.RALLY_ENABLED else "disabled"
     )
     print(f"\n=== Hyperliquid news notifier — {banner} ===")
     print(f"log file: {LOG_PATH}")
     print(f"analyzer model: {ANALYZER_MODEL}")
     print(f"execution: {exec_mode}")
     print(f"bigswing (full-balance tier): {bigswing_mode}")
+    print(f"rally (news+book+trend tier): {rally_mode}")
     print(f"markets: {coins}")
     print(f"channels: {config.TELEGRAM_CHANNELS}\n")
 
