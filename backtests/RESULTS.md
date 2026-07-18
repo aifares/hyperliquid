@@ -238,3 +238,63 @@ Tick-level orderbook confirmation is **not** in this test (no historical L2).
 - Live gate (per-asset + SPY): geom avg **+0.06%**, win 40% (kept 78% of days)
 - VERDICT: gate helps slightly — keep defaults; validate tick-confirm live via
   `journal.rally_arm_stats()` before enabling real rally orders.
+
+## Breakout tier — HOD / opening-range vs multi-day Donchian (2026-07-18)
+
+`backtests/breakout_bt.py`. Tests the proposed intraday `breakout` tier (buy
+the break of the session/opening-range high, short the mirror, flat by the
+NYSE close) against the multi-day Donchian breakout premise. HL egress was
+blocked in this environment, so this runs on the **cached** bars only:
+1h perp bars (real instrument, ~200 sessions x 9 names, 2025-12..2026-07) and
+10y daily underlying (`px_*.pkl`). All net of 0.11% friction + measured
+funding.
+
+### Study A — intraday ORB/HOD breakout on 1h perp bars ❌ NO EDGE
+Ten variants (ORB-1h/2h, rolling-HOD, long-only/short-only, 1R/2R/3R targets,
+range-stop vs 1% stop, tight/wide buffer, trend filter). **Every one loses.**
+
+- Best case (ORB-1h, L+S, 2R): n=1619, win **38.5%**, mean **-0.110%**/trade,
+  total **-178%**. Note mean ≈ **exactly minus the 0.11% friction** — the
+  signature of a **zero-edge** entry (same result section 4 got for random
+  entries). The signal adds nothing; you just pay the friction.
+- **59-90% of trades exit by TIME**, targets hit only **2-18%** — the
+  "breakout" doesn't follow through, it chops sideways and closes near flat.
+  This echoes section 4: these markets don't travel far enough intraday for
+  target geometry to pay.
+- Trend filter barely moved it (-0.101% vs -0.110%); a tight 1% stop made it
+  much worse (-0.257%, whipsawed out 36% of the time); shorts were worse than
+  longs on every cut.
+- **Caveat:** 1h bars are too coarse to *fairly* judge a **tick-confirmed**
+  breakout — the live tier's edge (if any) lives in the seconds after the
+  break, which this resolution can't see. But the burden of proof now sits on
+  the intraday version: nothing here supports building it as specified, and a
+  proper test needs 5m/tick history (blocked here).
+
+### Study B — multi-day Donchian breakout premise (10y daily) ✅ ROBUST, LONG-ONLY
+Same "break the N-day high and hold" idea at the swing horizon, on 10y of
+daily underlying. This is where breakout momentum actually pays:
+
+- Donchian-20, **LONG-only**, 2R, hold 10d: n=977, win **59.7%**, mean
+  **+1.84%**/trade net.
+- Donchian-55, long-only, 2R, hold 20d: n=470, win 59.6%, mean **+2.82%**.
+- Long+short Donchian-20: +0.82%/trade — **shorting breakdowns halves it**;
+  these secular-uptrend names don't pay on the short side. Long-only.
+- Adding the per-name trend filter barely changed it (the 20-day channel
+  already implies trend); prior-1-day-high (tight) was noisy (win 46%,
+  median negative — a few big winners carry it).
+- **Robustness (Donchian-20 long):** positive on **9/9 names**
+  (+0.26% MSFT .. +4.61% TSLA; strongest TSLA/AMD/NVDA/MU) and **10 of 11
+  years**. Only **2022 is negative** (-1.26%, the bear) — the known failure
+  mode of long breakouts in a downtrend, i.e. it wants a broad-market regime
+  gate to stand longs down when the market is falling.
+
+### Verdict
+- **Do NOT build the intraday HOD/ORB breakout tier as originally specified** —
+  no measurable edge in anything testable here; it decays to paying friction.
+- **The breakout edge is real but lives at the multi-day (Donchian) horizon,
+  long-only** — which is essentially what `swing_signals.py` / bigswing
+  already does (Donchian-20 + trend). The takeaway is to lean on / harden that
+  path, not to add an intraday breakout tier.
+- If an intraday breakout tier is still wanted, it must first be validated on
+  real 5m/tick history with the live book-confirmation in place; treat it as
+  unproven until then.
